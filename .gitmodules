@@ -1,0 +1,3 @@
+[submodule "GC"]
+	path = GC
+	url = git@github.com:IDWMaster/GC.git
