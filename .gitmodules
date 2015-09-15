@@ -1,3 +1,6 @@
 [submodule "GC"]
 	path = GC
 	url = git@github.com:IDWMaster/GC.git
+[submodule "UALCompiler"]
+	path = UALCompiler
+	url = git@github.com:IDWMaster/UALCompiler.git
