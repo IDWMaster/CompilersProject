@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 2.6)
+project(UALRunner)
+add_executable(UALRunner main.cpp)
+SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -I. -std=c++11 -O2")
+target_link_libraries(UALRunner pthread dl)
