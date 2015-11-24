@@ -4,3 +4,6 @@
 [submodule "UALCompiler"]
 	path = UALCompiler
 	url = git@github.com:IDWMaster/UALCompiler.git
+[submodule "asmjit"]
+	path = asmjit
+	url = https://github.com/kobalicek/asmjit.git
