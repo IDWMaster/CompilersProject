@@ -46,11 +46,13 @@ public:
     return val;
   }
   void* Increment(size_t len) {
+    void* retval = this->ptr;
     if(len>this->len) {
       throw "up"; //barf
     }
     this->len-=len;
     this->ptr+=len; 
+    return retval;
   }
   char* ReadString() {
     char* start = (char*)this->ptr;
@@ -72,13 +74,13 @@ class UALModule; //forward-declaration
 /**
  * @summary A safe garbage collected handle object for C++
  * */
-template<typename T>
 class SafeGCHandle {
 public:
-  T** obj;
-  SafeGCHandle(T** objref) {
-    this->obj = objref;
-    GC_Mark(gc,objref,true);
+  void** obj;
+  template<typename T>
+  SafeGCHandle(T objref) {
+    this->obj = (void**)objref;
+    GC_Mark(gc,(void**)objref,true);
   }
   ~SafeGCHandle() {
     GC_Unmark(gc,obj,true);
@@ -87,48 +89,99 @@ public:
 
 
 
+
+typedef struct {
+  size_t count; //The number of elements in the array
+  size_t stride; //The size of each element in the array (in bytes), or zero if array of objects
+} GC_Array_Header;
+
+typedef struct {
+  uint32_t length;
+} GC_String_Header;
+
+
 /**
- * @summary A raw array of contiguous garbage-collected objects
+ * Creates an array of primitives
  * */
-class RawObjectArray {
-public:
-  void** array;
-  size_t count;
-  /**
-   * @summary Constructs an array of garbage-collected objects of the specified size
-   * @param count The number of elements in the array
-   * */
-  ObjectArray(size_t count) {
-    GC_Allocate(gc,sizeof(size_t)*count,0,&array,0);
-    GC_Mark(gc,&array,true);
+template<typename T>
+static inline void GC_Array_Create_Primitive(GC_Array_Header*& output, size_t count) {
+    GC_Allocate(gc,sizeof(GC_Array_Header)+(sizeof(T)*count),0,(void**)&output,0);
+    output->count = count;
+    output->stride = sizeof(T);
+}
+/**
+ * Creates an array of a managed datatype
+ * */
+static inline void GC_Array_Create(GC_Array_Header*& output, size_t count) {
+  GC_Allocate(gc,sizeof(GC_Array_Header),count,(void**)&output,0);
+  output->count = count;
+  output->stride = 0;
+}
+/**
+ * Creates a String from a C-string
+ * */
+static inline void GC_String_Create(GC_String_Header*& output, const char* cstr) {
+  //NOTE: This is out-of-spec. According to the ECMA specification for .NET -- strings should be encoded in UTF-16 format. Also; NULL-terminating the string isn't typical either; but whatever.
+  GC_Allocate(gc,sizeof(GC_String_Header)+strlen(cstr)+1,0,(void**)&output,0);
+  output->length = strlen(cstr);
+  memcpy(output+1,cstr,strlen(cstr)+1);
+}
+/**
+ * Converts a String to a C-string
+ * */
+static inline const char* GC_String_Cstr(GC_String_Header* ptr) {
+  return (const char*)(ptr+1);
+}
+
+
+
+/**
+ * Retrieve non-managed object from array (unsafe)
+ * */
+template<typename T>
+static inline T& GC_Array_Fetch(GC_Array_Header* header,size_t index) {
+  return ((T*)(header+1))[index];
+}
+/**
+ * Retrieve managed object from array (unsafe)
+ * */
+static inline void* GC_Array_Fetch(GC_Array_Header* header, size_t index) {
+  void** array = (void**)(header+1);
+  return array[index];
+}
+
+/**
+ * Sets an object value in an array of managed objects
+ * */
+template<typename T>
+static inline void GC_Array_Set(GC_Array_Header* header, size_t index, T* value) {
+  void** array = (void**)(header+1);
+  if(array[index]) {
+    GC_Unmark(gc,array+index,false);
   }
-  
-  ~ObjectArray() {
-    GC_Unmark(gc,&array,true);
-  }
-};
+  array[index] = value;
+  GC_Mark(gc,array+index,false);
+}
 
 
 class UALMethod {
 public:
   BStream str;
-  UALMethod(BStream& str) {
+  UALMethod(const BStream& str) {
     this->str = str;
   }
   /**
    * @summary Invokes this method with the specified arguments
-   * @param args Garbage collected array of arguments
-   * @param count The number of arguments being passed to the function
+   * @param args Stack-allocated array of arguments
    * */
-  void Invoke(void** args, size_t count) {
-    SafeGCHandle<void**> handle(&args);
+  void Invoke(void** args) {
     BStream reader = str;
     unsigned char opcode;
     while(opcode != 255) {
-      case 0:
-	//Load argument (argnum)
-	
-	break;
+      switch(opcode) {
+	case 0:
+	  break;
+      }
     }
   }
 }; 
@@ -147,14 +200,23 @@ public:
     
   }
   /**
-   * @summary Compiles this UAL type to native code (x86)
+   * @summary Compiles this UAL type to native code (x86), or interprets
    * */
   void Compile() {
+    if(!compiled) {
     uint32_t count;
     bstr.Read(count);
+    printf("Reading %i methods\n",count);
     size_t nativeCount = count; //Copy to size_t for faster performance
     for(size_t i = 0;i<nativeCount;i++) {
-      methods[bstr.ReadString()] = new UALMethod(bstr);
+      const char* mname = bstr.ReadString();
+      uint32_t mlen;
+      bstr.Read(mlen);
+      printf("%s of length %i\n",mname,(int)mlen);
+      
+      void* ptr = bstr.Increment(mlen);
+      methods[mname] = new UALMethod(BStream(ptr,mlen));
+    }
     }
   }
 };
@@ -180,19 +242,54 @@ public:
       printf("Loading %s\n",name);
       #endif
       types[std::string(name)] = new UALType(obj,this);
+      
     }
     
+  }
+  void LoadMain(int argc, char** argv) {
+    //Find main
+      UALType* mainClass = 0;
+      for(auto i = types.begin();i!= types.end();i++) {
+	i->second->Compile();
+	if(i->second->methods.find("Main") != i->second->methods.end()) {
+	  //Found it!
+	  mainClass = i->second;
+	}
+      }
+      if(mainClass == 0) {
+	printf("Error: Unable to find Main.\n");
+	return;
+      }
+      //Invoke main
+      GC_Array_Header* array;
+      GC_Array_Create(array,argc);
+      SafeGCHandle arrhandle(&array);
+      for(size_t i = 0;i<array->count;i++) {
+	GC_String_Header* managedString;
+	GC_String_Create(managedString,argv[i]);
+	SafeGCHandle stringHandle(&managedString);
+	GC_Array_Set(array,i,managedString);
+      }
+      mainClass->methods["Main"]->Invoke((void**)&array);
   }
 };
 
 
 int main(int argc, char** argv) {
-  int fd = open(argv[1],O_RDONLY);
+  
+  int fd = 0;
+  if(argc>1) {
+  fd = open(argv[1],O_RDONLY);
+  }else {
+    //Debug mode, open ual.out in current directory
+    fd = open(argv[1],O_RDONLY);
+  }
   struct stat us; //It's a MAC (status symbol)
   fstat(fd,&us);
   size_t len = us.st_size;
   void* ptr = mmap(0,len,PROT_READ,MAP_SHARED,fd,0);
   gc = GC_Init(3);
   UALModule* module = new UALModule(ptr,len);
+  module->LoadMain(argc-1,argv+1);
   return 0;
 }
