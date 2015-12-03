@@ -164,22 +164,74 @@ static inline void GC_Array_Set(GC_Array_Header* header, size_t index, T* value)
 }
 
 
+class StackEntry {
+public:
+  unsigned char entryType; //Entry type
+  /**
+   * 0 -- Undefined
+   * 1 -- Managed object (pointer)
+   * 
+   * */
+  
+  
+  void* value; //Value
+  StackEntry() {
+    entryType = 0;
+    value = 0;
+  }
+  void PutObject(void* obj) {
+    value = obj;
+    entryType = 1;
+    GC_Mark(gc,&obj,true);
+  }
+  void Release() {
+    if(entryType == 1) {
+      GC_Unmark(gc,&value,true);
+    }
+  }
+  
+};
 class UALMethod {
 public:
   BStream str;
+  bool isManaged;
   UALMethod(const BStream& str) {
     this->str = str;
+    this->str.Read(isManaged);
   }
   /**
    * @summary Invokes this method with the specified arguments
    * @param args Stack-allocated array of arguments
    * */
   void Invoke(void** args) {
+    StackEntry frame[10]; //No program should EVER need more than 10 frames..... Of course; they said that about RAM way back in the day.....
+    StackEntry* position = frame;
+    
     BStream reader = str;
     unsigned char opcode;
-    while(opcode != 255) {
+    while(reader.Read(opcode) != 255) {
+      printf("EXEC OP: %i\n",(int)opcode);
       switch(opcode) {
 	case 0:
+	  //TODO: Make this work with things other than Objects.
+	{
+	  uint32_t index;
+	  reader.Read(index);
+	  position->PutObject(args[index]);
+	  position++;
+	}
+	  break;
+	case 1:
+	  //TODO: Call function
+	  uint32_t funcID;
+	  reader.Read(funcID);
+	  printf("TODO: Function call not yet implemented (ID %i)\n",funcID);
+	  break;
+	case 10:
+	  break;
+	default:
+	  printf("ERR: Illegal OPCODE %i\n",(int)opcode);
+	  abort();
 	  break;
       }
     }
