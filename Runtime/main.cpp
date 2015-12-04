@@ -227,6 +227,15 @@ public:
 	  reader.Read(funcID);
 	  printf("TODO: Function call not yet implemented (ID %i)\n",funcID);
 	  break;
+	case 2:
+	{
+	  //Push string onto stack
+	  GC_String_Header* obj;
+	  GC_String_Create(obj,reader.ReadString());
+	  position->PutObject(obj);
+	  position++;
+	}
+	  break;
 	case 10:
 	  break;
 	default:
