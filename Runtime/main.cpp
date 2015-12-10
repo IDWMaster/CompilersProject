@@ -4,10 +4,12 @@
 #include <string.h>
 #include <memory>
 #include <stack>
+#include <vector>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <dlfcn.h>
 #include "../GC/GC.h"
 #define DEBUGMODE
 
@@ -101,6 +103,147 @@ typedef struct {
 
 
 /**
+ * @summary Reads white space
+ * @param found True if whitespace was found, false otherwise
+ * @returns The string up to the whitespace
+ * */
+static std::string Parser_ExpectWhitespace(const char*& str, bool& found) {
+  std::string retval; //std::string is slow. We could optimize this; but assembly loading/JITting or interpreting is expected to be slow at initial load with most runtimes. Performance shouldn't matter too much at early loading stage.
+  found = false;
+  while(*str != 0) {
+    if(isspace(*str)) {
+      while(isspace(*str)){str++;}
+      found = true;
+      return retval;
+    }else {
+      retval+=*str;
+    }
+    str++;
+  }
+  return retval;
+}
+
+/**
+ * @summary Expects a specific character
+ * @param acter The character to expect
+ * @param found True if the specified character was found, false otherwise.
+ * @returns The text up to the specified character
+ * */
+static std::string Parser_ExpectChar(const char*& str, char acter, bool& found) {
+  std::string retval;
+  while(*str != 0) {
+    if(*str == acter) {
+      str++;
+      return retval;
+    }
+    retval+=*str;
+    str++;
+  }
+  return retval;
+}
+
+
+/**
+ * @summary Expects a list of characters
+ * @param acters A list of characters to search for, followed by a NULL terminator
+ * @param found The memory address of the character which was found, or NULL if the character was not found.
+ * @returns The text up to the specified character
+ * */
+static std::string Parser_ExpectMultiChar(const char*& str, const char* acters, const char*& found) {
+  std::string retval;
+  found = 0;
+  while(*str != 0) {
+    const char* current = acters;
+    while(*current != 0) {
+    if(*str == *current) {
+      found = str;
+      str++;
+      return retval;
+    }
+    current++;
+    }
+    retval+=*str;
+    str++;
+  }
+  return retval;
+}
+
+/**
+ * @summary Expects a string
+ * @param acter The string to expect
+ * @param _found True if the specified string was found, false otherwise.
+ * @returns The text up to the specified string
+ * */
+static std::string Parser_ExpectString(const char*& str, const char* acter, bool& found) {
+  std::string retval;
+  while(*str != 0) {
+    if(*str == acter[0]) {
+      const char* cpos = acter;
+      found = true;
+      while(*str != 0) {
+	if(*cpos == 0) {
+	  //Found whole string
+	  found = true;
+	  return retval;
+	}
+	if(*str != *cpos) {
+	  found = false;
+	  break;
+	}
+	str++;
+	cpos++;
+      }
+      str++;
+      return retval;
+    }
+    retval+=*str;
+    str++;
+  }
+  return retval;
+}
+
+
+/**
+ * Contains information about a method signature
+ * */
+class MethodSignature {
+public:
+  std::string fullSignature;
+  std::string returnType; //Return type of method
+  std::string className; //Fully-qualified class name of method
+  std::string methodName;
+  std::vector<std::string> args;
+  MethodSignature() {
+  }
+  MethodSignature(const char* rawName) {
+    fullSignature = rawName;
+    bool found;
+   returnType = Parser_ExpectWhitespace(rawName,found);
+   className = Parser_ExpectString(rawName,"::",found);
+   methodName = Parser_ExpectChar(rawName,'(',found);
+   
+   while(true) {
+     const char* foundChar;
+     std::string argType = Parser_ExpectMultiChar(rawName,",)",foundChar);
+     if(argType.size()) {
+      args.push_back(argType);
+     }
+     if(*foundChar == ')') {
+       //End of arguments
+       break;
+     }
+   }
+  }
+  bool operator<(const MethodSignature& other) const {
+    return other.fullSignature<fullSignature;
+  }
+};
+
+
+
+
+
+/**
  * Creates an array of primitives
  * */
 template<typename T>
@@ -160,6 +303,7 @@ static inline void GC_Array_Set(GC_Array_Header* header, size_t index, T* value)
     GC_Unmark(gc,array+index,false);
   }
   array[index] = value;
+  //TODO: BUG This is causing string truncation
   GC_Mark(gc,array+index,false);
 }
 
@@ -191,19 +335,46 @@ public:
   }
   
 };
+
+class UALMethod;
+static UALMethod* ResolveMethod(void* assembly, uint32_t handle);
+static std::map<std::string,void(*)(GC_Array_Header*)> abi_ext;
+
+static void ConsoleOut(GC_Array_Header* args) {
+  printf("%s\n",GC_String_Cstr((GC_String_Header*)GC_Array_Fetch(args,0)));
+}
+static void PrintInt(GC_Array_Header* args) {
+  printf("%i\n",GC_Array_Fetch<int32_t>(args,0));
+}
+
+static void Ext_Invoke(const char* name, GC_Array_Header* args) {
+  abi_ext[name](args);
+}
+
+
 class UALMethod {
 public:
   BStream str;
   bool isManaged;
-  UALMethod(const BStream& str) {
+  void* assembly;
+  MethodSignature sig;
+  UALMethod(const BStream& str, void* assembly, const char* sig) {
+    this->sig = sig;
     this->str = str;
     this->str.Read(isManaged);
+    this->assembly = assembly;
   }
   /**
    * @summary Invokes this method with the specified arguments
-   * @param args Stack-allocated array of arguments
+   * @param args Array of arguments
    * */
-  void Invoke(void** args) {
+  void Invoke(GC_Array_Header* arglist) {
+    if(!isManaged) {
+      Ext_Invoke(sig.methodName.data(), arglist);
+      return;
+      
+    }
+    void** args = (void**)(arglist+1);
     StackEntry frame[10]; //No program should EVER need more than 10 frames..... Of course; they said that about RAM way back in the day.....
     StackEntry* position = frame;
     
@@ -223,9 +394,23 @@ public:
 	  break;
 	case 1:
 	  //TODO: Call function
+	{
 	  uint32_t funcID;
 	  reader.Read(funcID);
-	  printf("TODO: Function call not yet implemented (ID %i)\n",funcID);
+	  UALMethod* method = ResolveMethod(assembly,funcID);
+	  GC_Array_Header* arguments;
+	  size_t argcount = method->sig.args.size();
+	  GC_Array_Create(arguments,argcount);
+	  for(size_t i = 0;i<argcount;i++) {
+	    //Get arguments from stack
+	    position--;
+	    
+	    GC_Array_Set(arguments,i, position->value);
+	    
+	  printf("DEBUG: %s\n",GC_String_Cstr((GC_String_Header*)GC_Array_Fetch(arguments,0)));
+	  }
+	  method->Invoke(arguments);
+	}
 	  break;
 	case 2:
 	{
@@ -247,6 +432,7 @@ public:
   }
 }; 
 
+static std::map<std::string,UALMethod*> methodCache;
 class UALType {
 public:
   
@@ -276,15 +462,20 @@ public:
       printf("%s of length %i\n",mname,(int)mlen);
       
       void* ptr = bstr.Increment(mlen);
-      methods[mname] = new UALMethod(BStream(ptr,mlen));
+      UALMethod* method = new UALMethod(BStream(ptr,mlen),module,mname);
+      methods[mname] = method;
+      methodCache[mname] = method;
     }
     }
   }
 };
 
+
 class UALModule {
 public:
   std::map<std::string,UALType*> types;
+  std::map<uint32_t,std::string> methodImports;
+  
   UALModule(void* bytecode, size_t len) {
     BStream str(bytecode,len);
     uint32_t count;
@@ -305,22 +496,41 @@ public:
       types[std::string(name)] = new UALType(obj,this);
       
     }
+    str.Read(count);
+    printf("Reading %i methods\n",count);
+    
+    for(uint32_t i = 0;i<count;i++) {
+      uint32_t id;
+      str.Read(id);
+      char* methodName = str.ReadString();
+      methodImports[id] = methodName;
+      printf("Found %s\n",methodName);
+    }
     
   }
   void LoadMain(int argc, char** argv) {
     //Find main
+    //TODO: Parse method signatures from strings
       UALType* mainClass = 0;
+      UALMethod* mainMethod = 0;
       for(auto i = types.begin();i!= types.end();i++) {
 	i->second->Compile();
-	if(i->second->methods.find("Main") != i->second->methods.end()) {
-	  //Found it!
-	  mainClass = i->second;
+	for(auto bot = i->second->methods.begin();bot != i->second->methods.end();bot++) {
+	  MethodSignature sig(bot->first.c_str());
+	  if(sig.methodName == "Main" && sig.args.size() == 1) {
+	    if(sig.args[0] == "System.String[]") {
+	      mainMethod = bot->second;
+	      mainClass = i->second;
+	    }
+	  }
 	}
       }
       if(mainClass == 0) {
 	printf("Error: Unable to find Main.\n");
 	return;
       }
+      
+    
       //Invoke main
       GC_Array_Header* array;
       GC_Array_Create(array,argc);
@@ -331,13 +541,27 @@ public:
 	SafeGCHandle stringHandle(&managedString);
 	GC_Array_Set(array,i,managedString);
       }
-      mainClass->methods["Main"]->Invoke((void**)&array);
+      GC_Array_Header* argarray;
+      GC_Array_Create(argarray,1);
+      GC_Array_Set(argarray,0,array);
+      mainMethod->Invoke(argarray);
   }
 };
 
 
+static UALMethod* ResolveMethod(void* assembly, uint32_t handle) {
+  UALModule* module = (UALModule*)assembly;
+  std::string signature = module->methodImports[handle];
+  if(methodCache.find(signature) == methodCache.end()) {
+    return 0;
+  }
+  return methodCache[signature];
+}
+
+
 int main(int argc, char** argv) {
-  
+  abi_ext["ConsoleOut"] = ConsoleOut;
+  abi_ext["PrintInt"] = PrintInt;
   int fd = 0;
   if(argc>1) {
   fd = open(argv[1],O_RDONLY);
