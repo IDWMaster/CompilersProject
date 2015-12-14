@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <dlfcn.h>
 #include "../GC/GC.h"
+#include <set>
 #define DEBUGMODE
 
 void* gc;
@@ -344,7 +345,7 @@ static void ConsoleOut(GC_Array_Header* args) {
   printf("%s\n",GC_String_Cstr((GC_String_Header*)GC_Array_Fetch(args,0)));
 }
 static void PrintInt(GC_Array_Header* args) {
-  printf("%i\n",GC_Array_Fetch<int32_t>(args,0));
+  printf("%i\n",*(uint32_t*)GC_Array_Fetch(args,0));
 }
 
 static void Ext_Invoke(const char* name, GC_Array_Header* args) {
@@ -440,11 +441,45 @@ public:
 	}
 	  break;
 	case 5:
+	{
 	  position--;
 	  uint32_t argloc;
 	  reader.Read(argloc);
 	  GC_Array_Set(locals,argloc,position->value);
 	  position->Release();
+	}
+	  break;
+	case 6:
+	  //Jump (unconditional branch)
+	{
+	  uint32_t offset;
+	  reader.Read(offset);
+	  printf("DEBUG: Branch to %i\n",offset);
+	  reader.ptr = str.ptr+offset;
+	}
+	  break;
+	case 7:
+	  //Load local variable
+	{
+	  uint32_t offset;
+	  reader.Read(offset);
+	  position->PutObject(GC_Array_Fetch(locals,offset));
+	  position++;
+	}
+	  break;
+	case 9:
+	  //BLE!!!!!!!!! (make barfing sound here)
+	{
+	  uint32_t branchloc;
+	  reader.Read(branchloc);
+	  position-=2;
+	  uint32_t a = *(uint32_t*)(position->value);
+	  uint32_t b = *(uint32_t*)(position[1].value);
+	  printf("%i<=%i\n",a,b);
+	  position->Release();
+	  position[1].Release();
+	  reader.ptr = a<=b ? str.ptr+branchloc : reader.ptr;
+	}
 	  break;
 	case 10:
 	  break;
