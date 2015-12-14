@@ -5,6 +5,7 @@
 #include <memory>
 #include <stack>
 #include <vector>
+#include <complex>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -314,7 +315,6 @@ public:
   /**
    * 0 -- Undefined
    * 1 -- Managed object (pointer)
-   * 
    * */
   
   
@@ -326,7 +326,7 @@ public:
   void PutObject(void* obj) {
     value = obj;
     entryType = 1;
-    GC_Mark(gc,&obj,true);
+    GC_Mark(gc,&value,true);
   }
   void Release() {
     if(entryType == 1) {
@@ -358,10 +358,14 @@ public:
   bool isManaged;
   void* assembly;
   MethodSignature sig;
+  uint32_t localVarCount;
   UALMethod(const BStream& str, void* assembly, const char* sig) {
     this->sig = sig;
     this->str = str;
     this->str.Read(isManaged);
+    if(isManaged) {
+      this->str.Read(localVarCount);
+    }
     this->assembly = assembly;
   }
   /**
@@ -374,6 +378,11 @@ public:
       return;
       
     }
+    //Initialize local variables
+    GC_Array_Header* locals;
+    GC_Array_Create(locals,localVarCount);
+    SafeGCHandle handle(&locals);
+    
     void** args = (void**)(arglist+1);
     StackEntry frame[10]; //No program should EVER need more than 10 frames..... Of course; they said that about RAM way back in the day.....
     StackEntry* position = frame;
@@ -407,7 +416,6 @@ public:
 	    
 	    GC_Array_Set(arguments,i, position->value);
 	    
-	  printf("DEBUG: %s\n",GC_String_Cstr((GC_String_Header*)GC_Array_Fetch(arguments,0)));
 	  }
 	  method->Invoke(arguments);
 	}
@@ -420,6 +428,23 @@ public:
 	  position->PutObject(obj);
 	  position++;
 	}
+	  break;
+	case 4:
+	  //Load 32-bit integer
+	{
+	  uint32_t* val;
+	  GC_Allocate(gc,4,0,(void**)&val,0);
+	  reader.Read(*val);
+	  position->PutObject(val);
+	  position++;
+	}
+	  break;
+	case 5:
+	  position--;
+	  uint32_t argloc;
+	  reader.Read(argloc);
+	  GC_Array_Set(locals,argloc,position->value);
+	  position->Release();
 	  break;
 	case 10:
 	  break;
