@@ -342,10 +342,10 @@ static UALMethod* ResolveMethod(void* assembly, uint32_t handle);
 static std::map<std::string,void(*)(GC_Array_Header*)> abi_ext;
 
 static void ConsoleOut(GC_Array_Header* args) {
-  printf("%s\n",GC_String_Cstr((GC_String_Header*)GC_Array_Fetch(args,0)));
+  printf("%s",GC_String_Cstr((GC_String_Header*)GC_Array_Fetch(args,0)));
 }
 static void PrintInt(GC_Array_Header* args) {
-  printf("%i\n",*(uint32_t*)GC_Array_Fetch(args,0));
+  printf("%i",*(uint32_t*)GC_Array_Fetch(args,0));
 }
 
 static void Ext_Invoke(const char* name, GC_Array_Header* args) {
@@ -391,7 +391,6 @@ public:
     BStream reader = str;
     unsigned char opcode;
     while(reader.Read(opcode) != 255) {
-      printf("EXEC OP: %i\n",(int)opcode);
       switch(opcode) {
 	case 0:
 	  //TODO: Make this work with things other than Objects.
@@ -430,6 +429,10 @@ public:
 	  position++;
 	}
 	  break;
+	case 3:
+	  //Return
+	  return;
+	  break;
 	case 4:
 	  //Load 32-bit integer
 	{
@@ -442,6 +445,7 @@ public:
 	  break;
 	case 5:
 	{
+	  //Store local variable
 	  position--;
 	  uint32_t argloc;
 	  reader.Read(argloc);
@@ -454,8 +458,8 @@ public:
 	{
 	  uint32_t offset;
 	  reader.Read(offset);
-	  printf("DEBUG: Branch to %i\n",offset);
 	  reader.ptr = str.ptr+offset;
+	  reader.len = str.len-offset;
 	}
 	  break;
 	case 7:
@@ -467,6 +471,20 @@ public:
 	  position++;
 	}
 	  break;
+	case 8:
+	{
+	  position-=2;
+	  uint32_t a = *(uint32_t*)(position->value);
+	  uint32_t b = *(uint32_t*)(position[1].value);
+	  position->Release();
+	  position[1].Release();
+	  uint32_t* result;
+	  GC_Allocate(gc,4,0,(void**)&result,0);
+	  *result = a+b;
+	  position->PutObject(result);
+	  position++;
+	}
+	  break;
 	case 9:
 	  //BLE!!!!!!!!! (make barfing sound here)
 	{
@@ -475,13 +493,14 @@ public:
 	  position-=2;
 	  uint32_t a = *(uint32_t*)(position->value);
 	  uint32_t b = *(uint32_t*)(position[1].value);
-	  printf("%i<=%i\n",a,b);
 	  position->Release();
 	  position[1].Release();
 	  reader.ptr = a<=b ? str.ptr+branchloc : reader.ptr;
+	  reader.len = a<=b ? str.len-branchloc : reader.len;
 	}
 	  break;
 	case 10:
+	  //NOPE! Not gonna do that!
 	  break;
 	default:
 	  printf("ERR: Illegal OPCODE %i\n",(int)opcode);
@@ -513,13 +532,11 @@ public:
     if(!compiled) {
     uint32_t count;
     bstr.Read(count);
-    printf("Reading %i methods\n",count);
     size_t nativeCount = count; //Copy to size_t for faster performance
     for(size_t i = 0;i<nativeCount;i++) {
       const char* mname = bstr.ReadString();
       uint32_t mlen;
       bstr.Read(mlen);
-      printf("%s of length %i\n",mname,(int)mlen);
       
       void* ptr = bstr.Increment(mlen);
       UALMethod* method = new UALMethod(BStream(ptr,mlen),module,mname);
