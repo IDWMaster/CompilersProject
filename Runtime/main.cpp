@@ -502,6 +502,34 @@ public:
 	case 10:
 	  //NOPE! Not gonna do that!
 	  break;
+	case 11:
+	{
+	  //BEQ
+	  uint32_t branchloc;
+	  reader.Read(branchloc);
+	  position-=2;
+	  uint32_t a = *(uint32_t*)(position->value);
+	  uint32_t b = *(uint32_t*)(position[1].value);
+	  position->Release();
+	  position[1].Release();
+	  reader.ptr = a==b ? str.ptr+branchloc : reader.ptr;
+	  reader.len = a==b ? str.len-branchloc : reader.len;
+	}
+	  break;
+	case 12:
+	{
+	  //BNE
+	  uint32_t branchloc;
+	  reader.Read(branchloc);
+	  position-=2;
+	  uint32_t a = *(uint32_t*)(position->value);
+	  uint32_t b = *(uint32_t*)(position[1].value);
+	  position->Release();
+	  position[1].Release();
+	  reader.ptr = a!=b ? str.ptr+branchloc : reader.ptr;
+	  reader.len = a!=b ? str.len-branchloc : reader.len;
+	}
+	  break;
 	default:
 	  printf("ERR: Illegal OPCODE %i\n",(int)opcode);
 	  abort();
