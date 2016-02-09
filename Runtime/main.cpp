@@ -13,11 +13,18 @@
 #include <dlfcn.h>
 #include "../GC/GC.h"
 #include <set>
+#include "../asmjit/src/asmjit/asmjit.h"
 #define DEBUGMODE
 
 void* gc;
 
+//BEGIN PLATFORM CODE
 
+asmjit::JitRuntime* JITruntime;
+asmjit::X86Compiler* JITCompiler;
+
+
+//END PLATFORM CODE
 
 
 class BStream {
@@ -339,18 +346,20 @@ public:
 
 class UALMethod;
 static UALMethod* ResolveMethod(void* assembly, uint32_t handle);
-static std::map<std::string,void(*)(GC_Array_Header*)> abi_ext;
+static std::map<std::string,void*> abi_ext;
 
-static void ConsoleOut(GC_Array_Header* args) {
-  printf("%s",GC_String_Cstr((GC_String_Header*)GC_Array_Fetch(args,0)));
+static void ConsoleOut(GC_String_Header* str) {
+  printf("ConsoleOut invoked with %p\n",str);
+  printf("%s",GC_String_Cstr(str));
 }
 static void PrintInt(GC_Array_Header* args) {
   printf("%i",*(uint32_t*)GC_Array_Fetch(args,0));
 }
 
 static void Ext_Invoke(const char* name, GC_Array_Header* args) {
-  abi_ext[name](args);
+  ((void(*)(GC_Array_Header*))abi_ext[name])(args);
 }
+
 
 
 class UALMethod {
@@ -368,17 +377,167 @@ public:
       this->str.Read(localVarCount);
     }
     this->assembly = assembly;
+    nativefunc = 0;
+    
   }
+  void Compile() {
+    
+    //Compile UAL to x64
+    unsigned char opcode;
+    BStream reader = str;
+    auto GetOffset = [&](){
+      return ((size_t)reader.ptr)-((size_t)str.ptr);
+    };
+    std::map<size_t,asmjit::InstNode*> UALTox64Offsets;
+    auto addInstruction = [&](size_t ualpos,asmjit::InstNode* instruction){
+      UALTox64Offsets[ualpos] = instruction;
+    };
+    asmjit::FuncBuilderX builder;
+    builder.setRet(asmjit::kVarTypeIntPtr);
+    builder.addArg(asmjit::kVarTypeIntPtr);
+    JITCompiler->addFunc(asmjit::kFuncConvHost,builder);
+    
+    
+    
+    
+    
+    
+    
+    //asmjit::X86GpVar arglist = JITCompiler->newGpVar(); //NOTE: Old calling convention (used GC_Array_Header of arguments)
+    //JITCompiler->setArg(0,arglist);
+    StackEntry frame[10];
+    StackEntry* position = frame;
+    
+    
+    //Calling convention:
+    //Each argument is word size of processor
+    //For Object types, pass memory address in register (if available)
+    //TODO: Struct handling
+    
+    /**
+     * @summary Pops a variable from the stack, and puts it in the specified register or memory location
+     * */
+    auto pop = [&](asmjit::X86GpVar& location) {
+      position--;
+       switch(position->entryType) {
+	 case 0:
+	 {
+	   //Load value from argument
+	   uint32_t argidx = (uint32_t)(size_t)position->value;
+	   JITCompiler->setArg(argidx,location);
+	   position--;
+	 }
+	   break;
+	 case 1:
+	 {
+	   //Load managed object
+	   printf("Load immediate object %p\n",position->value);
+	   JITCompiler->mov(location,asmjit::imm((size_t)position->value)); //MOVImm ManagedObject
+	 }
+	   break;
+       }
+       
+    };
+    while(reader.Read(opcode) != 255) {
+      printf("OPCODE: %i\n",(int)opcode);
+      switch(opcode) {
+	case 0:
+	{
+	  //Push argument to evaluation stack
+	  uint32_t index;
+	  reader.Read(index);
+	  position->entryType = 0;
+	  position->value = (void*)index;
+	  position++;
+	}
+	  break;
+	case 1:
+	  //Call function
+	{
+	  uint32_t funcID;
+	  reader.Read(funcID);
+	  UALMethod* method = ResolveMethod(assembly,funcID);
+	  size_t argcount = method->sig.args.size();
+	  asmjit::FuncBuilderX methodsig;
+	  asmjit::X86CallNode* call;
+	  asmjit::X86GpVar* realargs = new asmjit::X86GpVar[argcount];
+	  //TODO: Problem here -- Popped value is stored in RBX register, but not passed as argument in function call
+	  
+	  //TODO: Above bug is fixed!
+	  
+	  for(size_t i = 0;i<argcount;i++) {
+	    //Pop arguments off stack
+	    realargs[i] = JITCompiler->newGpVar();
+	    pop(realargs[i]);
+	  }
+	  
+	  
+	  for(size_t i = 0;i<argcount;i++) {
+	    methodsig.addArg(asmjit::kVarTypeIntPtr);
+	  }
+	  if(method->nativefunc) {
+	    call = JITCompiler->call((size_t)method->nativefunc,asmjit::kFuncConvHost,methodsig);
+	  }else {
+	    //call = JITCompiler->call()
+	    void* funcptr = (void*)abi_ext[method->sig.methodName.data()];
+	    call = JITCompiler->call((size_t)funcptr,asmjit::kFuncConvHost,methodsig);
+	  }
+	  for(size_t i = 0;i<argcount;i++) {
+	    call->setArg(i,realargs[i]);
+	  }
+	  
+	  delete[] realargs;
+	  printf("TODO: Call function %s\n",method->sig.fullSignature.data());
+	  
+	}
+	  break;
+	case 2:
+	  //Load string
+	{
+	  GC_String_Header* hdr;
+	  GC_String_Create(hdr,reader.ReadString());
+	  position->value = hdr;
+	  position->entryType = 1; //Load managed object
+	  position++;
+	}
+	  break;
+	case 10:
+	  //NOPE. Not gonna happen.
+	{
+	  size_t ualpos = GetOffset()-1;
+	  addInstruction(ualpos,JITCompiler->nop());
+	}
+	  break;
+	default:
+	  printf("Unknown OPCODE %i\n",(int)opcode);
+	  goto velociraptor;
+      }
+    }
+    velociraptor:
+    JITCompiler->ret();
+    JITCompiler->endFunc();
+    nativefunc = (void(*)(GC_Array_Header*))JITCompiler->make();
+  }
+  void(*nativefunc)(GC_Array_Header*);
+  
   /**
    * @summary Invokes this method with the specified arguments
    * @param args Array of arguments
    * */
   void Invoke(GC_Array_Header* arglist) {
+    
     if(!isManaged) {
       Ext_Invoke(sig.methodName.data(), arglist);
       return;
       
     }
+    if(nativefunc == 0) {
+      Compile();
+    }
+    printf("Invoking\n");
+    nativefunc(arglist);
+    printf("Invoked\n");
+    return;
     //Initialize local variables
     GC_Array_Header* locals;
     GC_Array_Create(locals,localVarCount);
@@ -665,8 +824,31 @@ static UALMethod* ResolveMethod(void* assembly, uint32_t handle) {
 
 
 int main(int argc, char** argv) {
-  abi_ext["ConsoleOut"] = ConsoleOut;
-  abi_ext["PrintInt"] = PrintInt;
+  //JIT test
+  /*asmjit::JitRuntime runtime;
+  asmjit::X86Compiler compiler(&runtime);
+  asmjit::FuncBuilderX builder;
+  builder.addArg(asmjit::kVarTypeIntPtr);
+  builder.addArg(asmjit::kVarTypeIntPtr);
+  builder.setRet(asmjit::kVarTypeIntPtr);
+  compiler.addFunc(asmjit::kFuncConvHost,builder);
+  asmjit::X86GpVar a = compiler.newGpVar();
+  asmjit::X86GpVar b = compiler.newGpVar();
+  compiler.setArg(0,a);
+  compiler.setArg(1,b);
+  compiler.add(a,b);
+  compiler.ret(a);
+  compiler.endFunc();
+  size_t(*addfunc)(size_t,size_t) = (size_t(*)(size_t,size_t))compiler.make();
+  int ret = (int)addfunc(5,2);
+  printf("%i\n",ret);
+  return 0;
+  */
+  JITruntime = new asmjit::JitRuntime();
+  JITCompiler = new asmjit::X86Compiler(JITruntime);
+  
+  abi_ext["ConsoleOut"] = (void*)ConsoleOut;
+  abi_ext["PrintInt"] = (void*)PrintInt;
   int fd = 0;
   if(argc>1) {
   fd = open(argv[1],O_RDONLY);

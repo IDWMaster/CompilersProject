@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 2.6)
 project(UALRunner)
 add_executable(UALRunner main.cpp ../GC/GC.cpp)
-SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -I. -std=c++11 -g")
-target_link_libraries(UALRunner pthread dl)
+SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -I. -std=c++11 -g -O0")
+SET(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -L../asmjit -Wl,--rpath=../asmjit")
+target_link_libraries(UALRunner pthread dl asmjit)
