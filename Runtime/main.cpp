@@ -349,7 +349,6 @@ static UALMethod* ResolveMethod(void* assembly, uint32_t handle);
 static std::map<std::string,void*> abi_ext;
 
 static void ConsoleOut(GC_String_Header* str) {
-  printf("ConsoleOut invoked with %p\n",str);
   printf("%s",GC_String_Cstr(str));
 }
 static void PrintInt(GC_Array_Header* args) {
@@ -388,8 +387,8 @@ public:
     auto GetOffset = [&](){
       return ((size_t)reader.ptr)-((size_t)str.ptr);
     };
-    std::map<size_t,asmjit::InstNode*> UALTox64Offsets;
-    auto addInstruction = [&](size_t ualpos,asmjit::InstNode* instruction){
+    std::map<size_t,asmjit::Label> UALTox64Offsets;
+    auto addInstruction = [&](size_t ualpos,const asmjit::Label& instruction){
       UALTox64Offsets[ualpos] = instruction;
     };
     asmjit::FuncBuilderX builder;
@@ -431,8 +430,13 @@ public:
 	 case 1:
 	 {
 	   //Load managed object
-	   printf("Load immediate object %p\n",position->value);
 	   JITCompiler->mov(location,asmjit::imm((size_t)position->value)); //MOVImm ManagedObject
+	 }
+	   break;
+	 case 2:
+	 {
+	   //Load 32-bit word immediate
+	   JITCompiler->mov(location,asmjit::imm((int)(ssize_t)position->value));
 	 }
 	   break;
        }
@@ -454,6 +458,9 @@ public:
 	case 1:
 	  //Call function
 	{
+	  size_t ualpos = GetOffset()-1;
+	  addInstruction(ualpos,JITCompiler->newLabel());
+	  
 	  uint32_t funcID;
 	  reader.Read(funcID);
 	  UALMethod* method = ResolveMethod(assembly,funcID);
@@ -461,9 +468,6 @@ public:
 	  asmjit::FuncBuilderX methodsig;
 	  asmjit::X86CallNode* call;
 	  asmjit::X86GpVar* realargs = new asmjit::X86GpVar[argcount];
-	  //TODO: Problem here -- Popped value is stored in RBX register, but not passed as argument in function call
-	  
-	  //TODO: Above bug is fixed!
 	  
 	  for(size_t i = 0;i<argcount;i++) {
 	    //Pop arguments off stack
@@ -487,13 +491,16 @@ public:
 	  }
 	  
 	  delete[] realargs;
-	  printf("TODO: Call function %s\n",method->sig.fullSignature.data());
 	  
 	}
 	  break;
 	case 2:
 	  //Load string
 	{
+	  size_t ualpos = GetOffset()-1;
+	  addInstruction(ualpos,JITCompiler->newLabel());
+	  //TODO ASAP NOTICE: This is currently unsafe as the JIT could move the string around before we get into user code.
+	  //We need a kind of constant object pool or something to fix this problem.
 	  GC_String_Header* hdr;
 	  GC_String_Create(hdr,reader.ReadString());
 	  position->value = hdr;
@@ -501,11 +508,23 @@ public:
 	  position++;
 	}
 	  break;
+	case 4:
+	{
+	  //Load 32-bit integer immediate
+	  size_t ualpos = GetOffset()-1;
+	  addInstruction(ualpos,JITCompiler->newLabel());
+	  uint32_t val;
+	  reader.Read(val);
+	  position->entryType = 2; //Load 32-bit word
+	  position->value = (void*)(uint64_t)val;
+	  position++;
+	}
+	  break;
 	case 10:
 	  //NOPE. Not gonna happen.
 	{
 	  size_t ualpos = GetOffset()-1;
-	  addInstruction(ualpos,JITCompiler->nop());
+	  addInstruction(ualpos,JITCompiler->newLabel());
 	}
 	  break;
 	default:
@@ -534,9 +553,7 @@ public:
     if(nativefunc == 0) {
       Compile();
     }
-    printf("Invoking\n");
     nativefunc(arglist);
-    printf("Invoked\n");
     return;
     //Initialize local variables
     GC_Array_Header* locals;
