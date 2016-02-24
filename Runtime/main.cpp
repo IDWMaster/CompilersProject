@@ -91,10 +91,10 @@ public:
   template<typename T>
   SafeGCHandle(T objref) {
     this->obj = (void**)objref;
-    GC_Mark(gc,(void**)objref,true);
+    GC_Mark((void**)objref,true);
   }
   ~SafeGCHandle() {
-    GC_Unmark(gc,obj,true);
+    GC_Unmark(obj,true);
   }
 };
 
@@ -257,7 +257,7 @@ public:
  * */
 template<typename T>
 static inline void GC_Array_Create_Primitive(GC_Array_Header*& output, size_t count) {
-    GC_Allocate(gc,sizeof(GC_Array_Header)+(sizeof(T)*count),0,(void**)&output,0);
+    GC_Allocate(sizeof(GC_Array_Header)+(sizeof(T)*count),0,(void**)&output,0);
     output->count = count;
     output->stride = sizeof(T);
 }
@@ -265,7 +265,7 @@ static inline void GC_Array_Create_Primitive(GC_Array_Header*& output, size_t co
  * Creates an array of a managed datatype
  * */
 static inline void GC_Array_Create(GC_Array_Header*& output, size_t count) {
-  GC_Allocate(gc,sizeof(GC_Array_Header),count,(void**)&output,0);
+  GC_Allocate(sizeof(GC_Array_Header),count,(void**)&output,0);
   output->count = count;
   output->stride = 0;
 }
@@ -274,7 +274,7 @@ static inline void GC_Array_Create(GC_Array_Header*& output, size_t count) {
  * */
 static inline void GC_String_Create(GC_String_Header*& output, const char* cstr) {
   //NOTE: This is out-of-spec. According to the ECMA specification for .NET -- strings should be encoded in UTF-16 format. Also; NULL-terminating the string isn't typical either; but whatever.
-  GC_Allocate(gc,sizeof(GC_String_Header)+strlen(cstr)+1,0,(void**)&output,0);
+  GC_Allocate(sizeof(GC_String_Header)+strlen(cstr)+1,0,(void**)&output,0);
   output->length = strlen(cstr);
   memcpy(output+1,cstr,strlen(cstr)+1);
 }
@@ -309,11 +309,11 @@ template<typename T>
 static inline void GC_Array_Set(GC_Array_Header* header, size_t index, T* value) {
   void** array = (void**)(header+1);
   if(array[index]) {
-    GC_Unmark(gc,array+index,false);
+    GC_Unmark(array+index,false);
   }
   array[index] = value;
   //TODO: BUG This is causing string truncation
-  GC_Mark(gc,array+index,false);
+  GC_Mark(array+index,false);
 }
 
 
@@ -334,11 +334,11 @@ public:
   void PutObject(void* obj) {
     value = obj;
     entryType = 1;
-    GC_Mark(gc,&value,true);
+    GC_Mark(&value,true);
   }
   void Release() {
     if(entryType == 1) {
-      GC_Unmark(gc,&value,true);
+      GC_Unmark(&value,true);
     }
   }
   
@@ -429,8 +429,24 @@ public:
 	   break;
 	 case 1:
 	 {
-	   //Load managed object
-	   JITCompiler->mov(location,asmjit::imm((size_t)position->value)); //MOVImm ManagedObject
+	   //Load string immediate
+	   //Need to call GC_String_Create with address of C string
+	   asmjit::X86Mem stackmem = JITCompiler->newStack(sizeof(size_t),sizeof(size_t));
+	   asmjit::X86GpVar stackptr = JITCompiler->newGpVar();
+	   asmjit::X86GpVar stringptr = JITCompiler->newGpVar();
+	   JITCompiler->lea(stackptr,stackmem); //Load effective address of stack memory (contains pointer to GC_String_Header)
+	   JITCompiler->mov(stringptr,asmjit::imm((size_t)position->value));
+	   asmjit::FuncBuilderX builder;
+	   builder.addArg(asmjit::kVarTypeIntPtr);
+	   builder.addArg(asmjit::kVarTypeIntPtr);
+	   //Create managed string from C-string
+	   asmjit::X86CallNode* funccall = JITCompiler->call((size_t)&GC_String_Create,asmjit::kFuncConvHost,builder);
+	   funccall->setArg(0,stackptr);
+	   funccall->setArg(1,stringptr);
+	   JITCompiler->mov(stackptr,stackmem);
+	   //MOVE managed object
+	   JITCompiler->mov(location,stackptr); //MOVImm ManagedObject
+	   
 	 }
 	   break;
 	 case 2:
@@ -441,6 +457,27 @@ public:
 	   break;
        }
        
+    };
+    //Execute a write barrier mark at the location specified in this register.
+    auto mark = [&](asmjit::X86GpVar& location, bool isRoot) {
+      asmjit::FuncBuilderX builder;
+      builder.addArg(asmjit::kVarTypeIntPtr);
+      builder.addArg(asmjit::kVarTypeIntPtr);
+      asmjit::X86CallNode* funccall = JITCompiler->call((size_t)&GC_Mark,asmjit::kFuncConvHost,builder);
+      
+      funccall->setArg(0,location);
+      funccall->setArg(1,asmjit::imm(isRoot));
+      
+    };
+    auto unmark = [&](asmjit::X86GpVar& location, bool isRoot) {
+      asmjit::FuncBuilderX builder;
+      builder.addArg(asmjit::kVarTypeIntPtr);
+      builder.addArg(asmjit::kVarTypeIntPtr);
+      asmjit::X86CallNode* funccall = JITCompiler->call((size_t)&GC_Unmark,asmjit::kFuncConvHost,builder);
+      
+      funccall->setArg(0,location);
+      funccall->setArg(1,asmjit::imm(isRoot));
+      
     };
     while(reader.Read(opcode) != 255) {
       printf("OPCODE: %i\n",(int)opcode);
@@ -467,12 +504,28 @@ public:
 	  size_t argcount = method->sig.args.size();
 	  asmjit::FuncBuilderX methodsig;
 	  asmjit::X86CallNode* call;
+	  
+	  
+	  //Stack memory for managed objects. For now; we'll assume that they're all managed.
+	  asmjit::X86Mem stackmem = JITCompiler->newStack(argcount*8,sizeof(size_t));
 	  asmjit::X86GpVar* realargs = new asmjit::X86GpVar[argcount];
 	  
+	    asmjit::X86GpVar temp = JITCompiler->newGpVar();
 	  for(size_t i = 0;i<argcount;i++) {
 	    //Pop arguments off stack
 	    realargs[i] = JITCompiler->newGpVar();
+	    
+	    //TODO: If we're popping a managed object, we have to make a copy of it to the stack, and execute a write barrier.
+	    //For now; we'll assume that everything's managed.
+	    
 	    pop(realargs[i]);
+	    //Copy managed object to stack
+	    JITCompiler->lea(temp,stackmem); //Load effective address of stack memory. 
+	    JITCompiler->add(temp,sizeof(size_t)*i);
+	    
+	    JITCompiler->mov(JITCompiler->intptr_ptr(temp),realargs[i]);
+	    //Execute write barrier
+	    mark(temp,true);
 	  }
 	  
 	  
@@ -490,6 +543,13 @@ public:
 	    call->setArg(i,realargs[i]);
 	  }
 	  
+	  for(size_t i = 0;i<argcount;i++) {
+	    JITCompiler->lea(temp,stackmem); //Load effective address of stack memory. 
+	    JITCompiler->add(temp,sizeof(size_t)*i);
+	    JITCompiler->mov(JITCompiler->intptr_ptr(temp,0),realargs[i]);
+	    //Execute write barrier
+	    unmark(temp,true);
+	  }
 	  delete[] realargs;
 	  
 	}
@@ -499,12 +559,9 @@ public:
 	{
 	  size_t ualpos = GetOffset()-1;
 	  addInstruction(ualpos,JITCompiler->newLabel());
-	  //TODO ASAP NOTICE: This is currently unsafe as the JIT could move the string around before we get into user code.
-	  //We need a kind of constant object pool or something to fix this problem.
-	  GC_String_Header* hdr;
-	  GC_String_Create(hdr,reader.ReadString());
-	  position->value = hdr;
-	  position->entryType = 1; //Load managed object
+	  
+	  position->value = reader.ReadString();
+	  position->entryType = 1; //Load string
 	  position++;
 	}
 	  break;
@@ -613,7 +670,7 @@ public:
 	  //Load 32-bit integer
 	{
 	  uint32_t* val;
-	  GC_Allocate(gc,4,0,(void**)&val,0);
+	  GC_Allocate(4,0,(void**)&val,0);
 	  reader.Read(*val);
 	  position->PutObject(val);
 	  position++;
@@ -655,7 +712,7 @@ public:
 	  position->Release();
 	  position[1].Release();
 	  uint32_t* result;
-	  GC_Allocate(gc,4,0,(void**)&result,0);
+	  GC_Allocate(4,0,(void**)&result,0);
 	  *result = a+b;
 	  position->PutObject(result);
 	  position++;
