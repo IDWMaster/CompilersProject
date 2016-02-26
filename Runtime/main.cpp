@@ -388,18 +388,21 @@ public:
       return ((size_t)reader.ptr)-((size_t)str.ptr);
     };
     std::map<size_t,asmjit::Label> UALTox64Offsets;
-    std::map<size_t,asmjit::InstNode*> pendingRelocations;
+    std::map<size_t,asmjit::Label> pendingRelocations;
     
-    auto addInstruction = [&](size_t ualpos,const asmjit::Label& instruction){
-      UALTox64Offsets[ualpos] = instruction;
+    auto addInstruction = [&](){
+      size_t ualpos = GetOffset()-1;
+      asmjit::Label instruction;
       if(pendingRelocations.find(ualpos) != pendingRelocations.end()) {
-	asmjit::InstNode* node = pendingRelocations[ualpos];
-	asmjit::InstNode* newnode = JITCompiler->jmp(instruction);
-	JITCompiler->removeNode(newnode);
-	JITCompiler->addNodeAfter(newnode,node);
-	JITCompiler->removeNode(node);
+	instruction = pendingRelocations[ualpos];
+	JITCompiler->bind(instruction);
 	pendingRelocations.erase(ualpos);
+      }else {
+	instruction = JITCompiler->newLabel();
+	JITCompiler->bind(instruction);
       }
+      UALTox64Offsets[ualpos] = instruction;
+      
     };
     asmjit::FuncBuilderX builder;
     builder.setRet(asmjit::kVarTypeIntPtr);
@@ -529,8 +532,7 @@ public:
 	case 1:
 	  //Call function
 	{
-	  size_t ualpos = GetOffset()-1;
-	  addInstruction(ualpos,MakeLabel());
+	  addInstruction();
 	  
 	  uint32_t funcID;
 	  reader.Read(funcID);
@@ -591,8 +593,7 @@ public:
 	case 2:
 	  //Load string
 	{
-	  size_t ualpos = GetOffset()-1;
-	  addInstruction(ualpos,MakeLabel());
+	  addInstruction();
 	  
 	  position->value = reader.ReadString();
 	  position->entryType = 1; //Load string
@@ -602,8 +603,7 @@ public:
 	case 4:
 	{
 	  //Load 32-bit integer immediate
-	  size_t ualpos = GetOffset()-1;
-	  addInstruction(ualpos,MakeLabel());
+	  addInstruction();
 	  uint32_t val;
 	  reader.Read(val);
 	  position->entryType = 2; //Load 32-bit word
@@ -614,9 +614,8 @@ public:
 	case 5:
 	  //stloc
 	{
-	  size_t ualpos = GetOffset()-1;
 	  uint32_t index;
-	  addInstruction(ualpos,MakeLabel());
+	  addInstruction();
 	  reader.Read(index);
 	  asmjit::X86GpVar temp = JITCompiler->newGpVar();
 	  JITCompiler->lea(temp,locals);
@@ -631,14 +630,15 @@ public:
 	case 6:
 	  //Branch to str.ptr+offset
 	{
-	  size_t ualpos = GetOffset()-1;
-	  addInstruction(ualpos,MakeLabel());
+	  addInstruction();
 	  uint32_t offset;
 	  reader.Read(offset);
 	  //TODO: Crashes on ondiscovered offset. Patch this later (defer) somehow.
 	  
 	   if(UALTox64Offsets.find(offset) == UALTox64Offsets.end()) {
-	    pendingRelocations[offset] = JITCompiler->nop();
+	     asmjit::Label jmpOffset = JITCompiler->newLabel();
+	    pendingRelocations[offset] = jmpOffset;
+	    JITCompiler->jmp(jmpOffset);
 	  }else {
 	    JITCompiler->jmp(UALTox64Offsets[offset]); //Make Link jump! (NO!!!!! It's Zelda!)
 	   }
@@ -647,8 +647,7 @@ public:
 	case 7:
 	{
 	  //LDLOC
-	  size_t ualpos = GetOffset()-1;
-	  addInstruction(ualpos,MakeLabel());
+	  addInstruction();
 	  uint32_t id;
 	  reader.Read(id);
 	  //TODO: Push local variable onto stack
@@ -661,8 +660,7 @@ public:
 	{
 	  //Add values TODO type check
 	  //NOTE: We can only perform addition on native data types; not managed ones.
-	  size_t ualpos = GetOffset()-1;
-	  addInstruction(ualpos,MakeLabel());
+	  addInstruction();
 	  asmjit::X86GpVar a = JITCompiler->newGpVar();
 	  asmjit::X86GpVar b = JITCompiler->newGpVar();
 	  pop(a);
@@ -677,11 +675,22 @@ public:
 	case 10:
 	  //NOPE. Not gonna happen.
 	{
-	  size_t ualpos = GetOffset()-1;
-	  addInstruction(ualpos,MakeLabel());
+	  addInstruction();
 	  
 	}
 	  break;
+	  /*
+	case 12:
+	{
+	  //TODO: BNE
+	  size_t ualpos = GetOffset()-1;
+	  addInstruction(ualpos,MakeLabel());
+	  asmjit::X86GpVar v0 = JITCompiler->newGpVar();
+	  asmjit::X86GpVar v1 = JITCompiler->newGpVar();
+	  JITCompiler->cmp()
+	  JITCompiler->jne()
+	}
+	  break;*/
 	default:
 	  printf("Unknown OPCODE %i\n",(int)opcode);
 	  goto velociraptor;
