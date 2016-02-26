@@ -388,8 +388,18 @@ public:
       return ((size_t)reader.ptr)-((size_t)str.ptr);
     };
     std::map<size_t,asmjit::Label> UALTox64Offsets;
+    std::map<size_t,asmjit::InstNode*> pendingRelocations;
+    
     auto addInstruction = [&](size_t ualpos,const asmjit::Label& instruction){
       UALTox64Offsets[ualpos] = instruction;
+      if(pendingRelocations.find(ualpos) != pendingRelocations.end()) {
+	asmjit::InstNode* node = pendingRelocations[ualpos];
+	asmjit::InstNode* newnode = JITCompiler->jmp(instruction);
+	JITCompiler->removeNode(newnode);
+	JITCompiler->addNodeAfter(newnode,node);
+	JITCompiler->removeNode(node);
+	pendingRelocations.erase(ualpos);
+      }
     };
     asmjit::FuncBuilderX builder;
     builder.setRet(asmjit::kVarTypeIntPtr);
@@ -398,6 +408,7 @@ public:
     
     
     
+    asmjit::X86Mem locals = JITCompiler->newStack(localVarCount*sizeof(size_t),sizeof(size_t));
     
     
     
@@ -455,6 +466,22 @@ public:
 	   JITCompiler->mov(location,asmjit::imm((int)(ssize_t)position->value));
 	 }
 	   break;
+	 case 3:
+	 {
+	   //Pop from local variable
+	   size_t varidx = (size_t)position->value;
+	   JITCompiler->lea(location,locals);
+	   JITCompiler->add(location,varidx*sizeof(size_t));
+	   JITCompiler->mov(location,JITCompiler->intptr_ptr(location));
+	   
+	 }
+	   break;
+	 case 4:
+	 {
+	   //Pop from real stack (TODO: Can we optimize out unnecessary memory access here somehow optimizing into registers if possible?)
+	   JITCompiler->pop(location);
+	 }
+	   break;
        }
        
     };
@@ -478,7 +505,14 @@ public:
       funccall->setArg(0,location);
       funccall->setArg(1,asmjit::imm(isRoot));
       
+      
     };
+    auto MakeLabel = [&]() {
+      asmjit::Label retval = JITCompiler->newLabel();
+      JITCompiler->bind(retval);
+      return retval;
+    };
+    
     while(reader.Read(opcode) != 255) {
       printf("OPCODE: %i\n",(int)opcode);
       switch(opcode) {
@@ -496,7 +530,7 @@ public:
 	  //Call function
 	{
 	  size_t ualpos = GetOffset()-1;
-	  addInstruction(ualpos,JITCompiler->newLabel());
+	  addInstruction(ualpos,MakeLabel());
 	  
 	  uint32_t funcID;
 	  reader.Read(funcID);
@@ -558,7 +592,7 @@ public:
 	  //Load string
 	{
 	  size_t ualpos = GetOffset()-1;
-	  addInstruction(ualpos,JITCompiler->newLabel());
+	  addInstruction(ualpos,MakeLabel());
 	  
 	  position->value = reader.ReadString();
 	  position->entryType = 1; //Load string
@@ -569,7 +603,7 @@ public:
 	{
 	  //Load 32-bit integer immediate
 	  size_t ualpos = GetOffset()-1;
-	  addInstruction(ualpos,JITCompiler->newLabel());
+	  addInstruction(ualpos,MakeLabel());
 	  uint32_t val;
 	  reader.Read(val);
 	  position->entryType = 2; //Load 32-bit word
@@ -577,11 +611,75 @@ public:
 	  position++;
 	}
 	  break;
+	case 5:
+	  //stloc
+	{
+	  size_t ualpos = GetOffset()-1;
+	  uint32_t index;
+	  addInstruction(ualpos,MakeLabel());
+	  reader.Read(index);
+	  asmjit::X86GpVar temp = JITCompiler->newGpVar();
+	  JITCompiler->lea(temp,locals);
+	  JITCompiler->add(temp,(size_t)(sizeof(size_t)*index));
+	  //TODO: Assume managed object for now.
+	  asmjit::X86GpVar valreg = JITCompiler->newGpVar();
+	  pop(valreg);
+	  JITCompiler->mov(JITCompiler->intptr_ptr(temp),valreg);
+	  
+	}
+	  break;
+	case 6:
+	  //Branch to str.ptr+offset
+	{
+	  size_t ualpos = GetOffset()-1;
+	  addInstruction(ualpos,MakeLabel());
+	  uint32_t offset;
+	  reader.Read(offset);
+	  //TODO: Crashes on ondiscovered offset. Patch this later (defer) somehow.
+	  
+	   if(UALTox64Offsets.find(offset) == UALTox64Offsets.end()) {
+	    pendingRelocations[offset] = JITCompiler->nop();
+	  }else {
+	    JITCompiler->jmp(UALTox64Offsets[offset]); //Make Link jump! (NO!!!!! It's Zelda!)
+	   }
+	}
+	  break;
+	case 7:
+	{
+	  //LDLOC
+	  size_t ualpos = GetOffset()-1;
+	  addInstruction(ualpos,MakeLabel());
+	  uint32_t id;
+	  reader.Read(id);
+	  //TODO: Push local variable onto stack
+	  position->entryType = 3;
+	  position->value = (void*)(size_t)id;
+	  position++;
+	}
+	  break;
+	case 8:
+	{
+	  //Add values TODO type check
+	  //NOTE: We can only perform addition on native data types; not managed ones.
+	  size_t ualpos = GetOffset()-1;
+	  addInstruction(ualpos,MakeLabel());
+	  asmjit::X86GpVar a = JITCompiler->newGpVar();
+	  asmjit::X86GpVar b = JITCompiler->newGpVar();
+	  pop(a);
+	  pop(b);
+	  JITCompiler->add(a,b);
+	  //TODO: Push result to stack
+	  JITCompiler->push(a);
+	  position->entryType = 4;
+	  position++;
+	}
+	  break;
 	case 10:
 	  //NOPE. Not gonna happen.
 	{
 	  size_t ualpos = GetOffset()-1;
-	  addInstruction(ualpos,JITCompiler->newLabel());
+	  addInstruction(ualpos,MakeLabel());
+	  
 	}
 	  break;
 	default:
@@ -590,6 +688,13 @@ public:
       }
     }
     velociraptor:
+    
+    if(pendingRelocations.size()) {
+      printf("ERROR: Unable to compile. One or more relocated code sections could not be resolved.\n");
+      
+      throw "up";
+    }
+    
     JITCompiler->ret();
     JITCompiler->endFunc();
     nativefunc = (void(*)(GC_Array_Header*))JITCompiler->make();
