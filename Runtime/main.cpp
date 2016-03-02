@@ -27,6 +27,8 @@ asmjit::X86Compiler* JITCompiler;
 //END PLATFORM CODE
 
 
+
+
 class BStream {
 public:
   unsigned char* ptr;
@@ -317,6 +319,16 @@ static inline void GC_Array_Set(GC_Array_Header* header, size_t index, T* value)
 }
 
 
+
+class Type {
+public:
+  size_t size; //The total size of this type (used when allocating memory)
+  std::map<std::string,Type*> fields; //Fields in this type
+  std::string name; //The fully-qualified name of the type
+  bool isStruct; //Whether or not this type should be treated as a struct or a managed object.
+  virtual ~Type(){};
+};
+
 class StackEntry {
 public:
   unsigned char entryType; //Entry type
@@ -330,6 +342,7 @@ public:
   StackEntry() {
     entryType = 0;
     value = 0;
+    type = 0;
   }
   void PutObject(void* obj) {
     value = obj;
@@ -341,7 +354,7 @@ public:
       GC_Unmark(&value,true);
     }
   }
-  
+  Type* type;
 };
 
 class UALMethod;
@@ -351,8 +364,8 @@ static std::map<std::string,void*> abi_ext;
 static void ConsoleOut(GC_String_Header* str) {
   printf("%s",GC_String_Cstr(str));
 }
-static void PrintInt(GC_Array_Header* args) {
-  printf("%i",*(uint32_t*)GC_Array_Fetch(args,0));
+static void PrintInt(int eger) {
+  printf("%i",eger);
 }
 
 static void Ext_Invoke(const char* name, GC_Array_Header* args) {
@@ -360,6 +373,28 @@ static void Ext_Invoke(const char* name, GC_Array_Header* args) {
 }
 
 
+Type* ResolveType(const char* name);
+
+class DeferredOperation {
+public:
+  virtual void Run(const asmjit::X86GpVar& output) = 0;
+  virtual ~DeferredOperation(){};
+};
+template<typename T>
+class DeferredOperationFunctor:public DeferredOperation {
+public:
+  T functor;
+DeferredOperationFunctor(const T& func):functor(func) {
+}
+  void Run(const asmjit::X86GpVar& output) {
+    functor(output);
+  }
+};
+
+template<typename T>
+static DeferredOperation* MakeDeferred(const T& functor) {
+  return new DeferredOperationFunctor<T>(functor);
+}
 
 class UALMethod {
 public:
@@ -368,12 +403,17 @@ public:
   void* assembly;
   MethodSignature sig;
   uint32_t localVarCount;
+  std::vector<std::string> locals;
   UALMethod(const BStream& str, void* assembly, const char* sig) {
     this->sig = sig;
     this->str = str;
     this->str.Read(isManaged);
     if(isManaged) {
       this->str.Read(localVarCount);
+      locals.resize(localVarCount);
+      for(size_t i = 0;i<localVarCount;i++) {
+	locals[i] = this->str.ReadString();
+      }
     }
     this->assembly = assembly;
     nativefunc = 0;
@@ -389,6 +429,8 @@ public:
     };
     std::map<size_t,asmjit::Label> UALTox64Offsets;
     std::map<size_t,asmjit::Label> pendingRelocations;
+    
+    
     
     auto addInstruction = [&](){
       size_t ualpos = GetOffset()-1;
@@ -438,7 +480,6 @@ public:
 	   //Load value from argument
 	   uint32_t argidx = (uint32_t)(size_t)position->value;
 	   JITCompiler->setArg(argidx,location);
-	   position--;
 	 }
 	   break;
 	 case 1:
@@ -460,7 +501,6 @@ public:
 	   JITCompiler->mov(stackptr,stackmem);
 	   //MOVE managed object
 	   JITCompiler->mov(location,stackptr); //MOVImm ManagedObject
-	   
 	 }
 	   break;
 	 case 2:
@@ -476,13 +516,13 @@ public:
 	   JITCompiler->lea(location,locals);
 	   JITCompiler->add(location,varidx*sizeof(size_t));
 	   JITCompiler->mov(location,JITCompiler->intptr_ptr(location));
-	   
 	 }
 	   break;
 	 case 4:
 	 {
-	   //Pop from real stack (TODO: Can we optimize out unnecessary memory access here somehow optimizing into registers if possible?)
-	   JITCompiler->pop(location);
+	   //Deferred operation TODO experimental and VERY unsafe
+	   DeferredOperation* dop = (DeferredOperation*)position->value;
+	   dop->Run(location);
 	 }
 	   break;
        }
@@ -526,6 +566,9 @@ public:
 	  reader.Read(index);
 	  position->entryType = 0;
 	  position->value = (void*)index;
+	  //TODO: Resolve argument type
+	  std::string tname = sig.args[index];
+	  position->type = ResolveType(tname.data());
 	  position++;
 	}
 	  break;
@@ -555,13 +598,17 @@ public:
 	    //For now; we'll assume that everything's managed.
 	    
 	    pop(realargs[i]);
+	    //Execute write barrier
+	    std::string atype = method->sig.args[i];
+	    if(!ResolveType(atype.data())->isStruct) {
+	      
 	    //Copy managed object to stack
 	    JITCompiler->lea(temp,stackmem); //Load effective address of stack memory. 
 	    JITCompiler->add(temp,sizeof(size_t)*i);
 	    
 	    JITCompiler->mov(JITCompiler->intptr_ptr(temp),realargs[i]);
-	    //Execute write barrier
-	    mark(temp,true);
+	      mark(temp,true);
+	    }
 	  }
 	  
 	  
@@ -584,7 +631,10 @@ public:
 	    JITCompiler->add(temp,sizeof(size_t)*i);
 	    JITCompiler->mov(JITCompiler->intptr_ptr(temp,0),realargs[i]);
 	    //Execute write barrier
-	    unmark(temp,true);
+	    std::string atype = method->sig.args[i];
+	    if(!ResolveType(atype.data())->isStruct) {
+	      unmark(temp,true);
+	    }
 	  }
 	  delete[] realargs;
 	  
@@ -597,7 +647,15 @@ public:
 	  
 	  position->value = reader.ReadString();
 	  position->entryType = 1; //Load string
+	  position->type = ResolveType("System.String");
 	  position++;
+	}
+	  break;
+	case 3:
+	{
+	  //RET
+	  JITCompiler->ret();
+	  
 	}
 	  break;
 	case 4:
@@ -607,6 +665,7 @@ public:
 	  uint32_t val;
 	  reader.Read(val);
 	  position->entryType = 2; //Load 32-bit word
+	  position->type = ResolveType("System.Int32");
 	  position->value = (void*)(uint64_t)val;
 	  position++;
 	}
@@ -614,13 +673,14 @@ public:
 	case 5:
 	  //stloc
 	{
+	  //TODO: stloc instruction is broken?
 	  uint32_t index;
 	  addInstruction();
 	  reader.Read(index);
 	  asmjit::X86GpVar temp = JITCompiler->newGpVar();
 	  JITCompiler->lea(temp,locals);
 	  JITCompiler->add(temp,(size_t)(sizeof(size_t)*index));
-	  //TODO: Assume managed object for now.
+	  //TODO: Write barrier if managed object
 	  asmjit::X86GpVar valreg = JITCompiler->newGpVar();
 	  pop(valreg);
 	  JITCompiler->mov(JITCompiler->intptr_ptr(temp),valreg);
@@ -653,6 +713,8 @@ public:
 	  //TODO: Push local variable onto stack
 	  position->entryType = 3;
 	  position->value = (void*)(size_t)id;
+	  std::string tname = this->locals[id];
+	  position->type = ResolveType(tname.data());
 	  position++;
 	}
 	  break;
@@ -660,15 +722,27 @@ public:
 	{
 	  //Add values TODO type check
 	  //NOTE: We can only perform addition on native data types; not managed ones.
+	  
+	  
+	  //TODO: Maybe we can defer execution of this whole segment until it is needed somehow?
 	  addInstruction();
-	  asmjit::X86GpVar a = JITCompiler->newGpVar();
-	  asmjit::X86GpVar b = JITCompiler->newGpVar();
-	  pop(a);
-	  pop(b);
-	  JITCompiler->add(a,b);
+	  
+	  //It's amazing this actually works....
+	  DeferredOperation* op = MakeDeferred([=](asmjit::X86GpVar output){
+	    
+	    asmjit::X86GpVar b = JITCompiler->newGpVar();
+	    pop(output);
+	    pop(b);
+	    JITCompiler->add(output,b);
+	    
+	  });
+	  
 	  //TODO: Push result to stack
-	  JITCompiler->push(a);
+	  //TODO: This is a bad idea. It messes up RSP and causes stuff to be written to the wrong place.
 	  position->entryType = 4;
+	  position->value = op;
+	  printf("TODO: How to push without messing up RSP?\n");
+	  
 	  position++;
 	}
 	  break;
@@ -679,18 +753,26 @@ public:
 	  
 	}
 	  break;
-	  /*
+	  
 	case 12:
 	{
 	  //TODO: BNE
-	  size_t ualpos = GetOffset()-1;
-	  addInstruction(ualpos,MakeLabel());
+	  addInstruction();
 	  asmjit::X86GpVar v0 = JITCompiler->newGpVar();
 	  asmjit::X86GpVar v1 = JITCompiler->newGpVar();
-	  JITCompiler->cmp()
-	  JITCompiler->jne()
+	  JITCompiler->cmp(v0,v1);
+	  uint32_t offset;
+	  reader.Read(offset);
+	  if(UALTox64Offsets.find(offset) != UALTox64Offsets.end()) {
+	    JITCompiler->jne(UALTox64Offsets[offset]);
+	  }else {
+	    asmjit::Label label = JITCompiler->newLabel();
+	    pendingRelocations[offset] = label;
+	    JITCompiler->jne(label);
+	    
+	  }
 	}
-	  break;*/
+	  break;
 	default:
 	  printf("Unknown OPCODE %i\n",(int)opcode);
 	  goto velociraptor;
@@ -707,6 +789,8 @@ public:
     JITCompiler->ret();
     JITCompiler->endFunc();
     nativefunc = (void(*)(GC_Array_Header*))JITCompiler->make();
+    
+    
   }
   void(*nativefunc)(GC_Array_Header*);
   
@@ -887,7 +971,7 @@ public:
 }; 
 
 static std::map<std::string,UALMethod*> methodCache;
-class UALType {
+class UALType:public Type {
 public:
   
   BStream bstr; //in-memory view of file
@@ -899,6 +983,10 @@ public:
     compiled = false;
     this->module = module;
     
+  }
+  UALType() {
+    //Special case: Builtin type.
+    compiled = true;
   }
   /**
    * @summary Compiles this UAL type to native code (x86), or interprets
@@ -923,6 +1011,12 @@ public:
 };
 
 
+static std::map<std::string,Type*> typeCache; //Cache of types
+Type* ResolveType(const char* name)
+{
+  return typeCache[name];
+}
+
 class UALModule {
 public:
   std::map<std::string,UALType*> types;
@@ -945,7 +1039,10 @@ public:
       #ifdef DEBUGMODE
       printf("Loading %s\n",name);
       #endif
-      types[std::string(name)] = new UALType(obj,this);
+      UALType* type = new UALType(obj,this);
+      types[std::string(name)] = type;
+      typeCache[std::string(name)] = type;
+      
       
     }
     str.Read(count);
@@ -976,6 +1073,7 @@ public:
 	    }
 	  }
 	}
+	
       }
       if(mainClass == 0) {
 	printf("Error: Unable to find Main.\n");
@@ -1035,8 +1133,20 @@ int main(int argc, char** argv) {
   JITruntime = new asmjit::JitRuntime();
   JITCompiler = new asmjit::X86Compiler(JITruntime);
   
+  //Register built-ins
   abi_ext["ConsoleOut"] = (void*)ConsoleOut;
   abi_ext["PrintInt"] = (void*)PrintInt;
+  UALType* btype = new UALType();
+  btype->isStruct = true;
+  btype->size = 4; //32-bit integer.
+  btype->name = "System.Int32";
+  typeCache["System.Int32"] = btype;
+  btype = new UALType();
+  btype->isStruct = false;
+  btype->size = sizeof(size_t); //A String just has a single pointer.
+  btype->name = "System.String";
+  typeCache["System.String"] = btype;
+  
   int fd = 0;
   if(argc>1) {
   fd = open(argv[1],O_RDONLY);
