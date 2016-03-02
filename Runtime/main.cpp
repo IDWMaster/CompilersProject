@@ -523,6 +523,7 @@ public:
 	   //Deferred operation TODO experimental and VERY unsafe
 	   DeferredOperation* dop = (DeferredOperation*)position->value;
 	   dop->Run(location);
+	   delete dop;
 	 }
 	   break;
        }
@@ -673,10 +674,10 @@ public:
 	case 5:
 	  //stloc
 	{
-	  //TODO: stloc instruction is broken?
 	  uint32_t index;
 	  addInstruction();
 	  reader.Read(index);
+	  
 	  asmjit::X86GpVar temp = JITCompiler->newGpVar();
 	  JITCompiler->lea(temp,locals);
 	  JITCompiler->add(temp,(size_t)(sizeof(size_t)*index));
@@ -731,7 +732,7 @@ public:
 	  DeferredOperation* op = MakeDeferred([=](asmjit::X86GpVar output){
 	    
 	    asmjit::X86GpVar b = JITCompiler->newGpVar();
-	    pop(output);
+	    pop(output); //TODO: Problem here -- stack frame issue.
 	    pop(b);
 	    JITCompiler->add(output,b);
 	    
@@ -741,7 +742,6 @@ public:
 	  //TODO: This is a bad idea. It messes up RSP and causes stuff to be written to the wrong place.
 	  position->entryType = 4;
 	  position->value = op;
-	  printf("TODO: How to push without messing up RSP?\n");
 	  
 	  position++;
 	}
