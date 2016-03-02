@@ -760,6 +760,8 @@ public:
 	  addInstruction();
 	  asmjit::X86GpVar v0 = JITCompiler->newGpVar();
 	  asmjit::X86GpVar v1 = JITCompiler->newGpVar();
+	  pop(v0);
+	  pop(v1);
 	  JITCompiler->cmp(v0,v1);
 	  uint32_t offset;
 	  reader.Read(offset);
