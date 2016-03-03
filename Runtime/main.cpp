@@ -630,22 +630,13 @@ public:
 	    //For now; we'll assume that everything's managed.
 	    
 	    pop(realargs[i]);
-	    //Execute write barrier
-	    std::string atype = method->sig.args[i];
-	    if(!ResolveType(atype.data())->isStruct) {
-	      
-	    //Copy managed object to stack
-	  /*  JITCompiler->lea(temp,stackmem); //Load effective address of stack memory. 
-	    JITCompiler->add(temp,sizeof(size_t)*i);
-	    
-	    JITCompiler->mov(JITCompiler->intptr_ptr(temp),realargs[i]);
-	      mark(temp,true);*/
-	    }
+	   
 	  }
 	  
 	  
 	  for(size_t i = 0;i<argcount;i++) {
 	    methodsig.addArg(asmjit::kVarTypeIntPtr);
+	   
 	  }
 	  if(method->nativefunc) {
 	    call = JITCompiler->call((size_t)method->nativefunc,asmjit::kFuncConvHost,methodsig);
@@ -655,19 +646,10 @@ public:
 	    call = JITCompiler->call((size_t)funcptr,asmjit::kFuncConvHost,methodsig);
 	  }
 	  for(size_t i = 0;i<argcount;i++) {
+	    
 	    call->setArg(i,realargs[i]);
 	  }
 	  
-	  for(size_t i = 0;i<argcount;i++) {
-	    JITCompiler->lea(temp,stackmem); //Load effective address of stack memory. 
-	    JITCompiler->add(temp,sizeof(size_t)*i);
-	    JITCompiler->mov(JITCompiler->intptr_ptr(temp,0),realargs[i]);
-	    //Execute write barrier
-	    std::string atype = method->sig.args[i];
-	    if(!ResolveType(atype.data())->isStruct) {
-	     // unmark(temp,true);
-	    }
-	  }
 	  delete[] realargs;
 	  
 	}
