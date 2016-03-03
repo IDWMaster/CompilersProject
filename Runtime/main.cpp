@@ -375,6 +375,37 @@ static void Ext_Invoke(const char* name, GC_Array_Header* args) {
 
 Type* ResolveType(const char* name);
 
+
+//A parse tree node
+
+enum NodeType {
+  CallNode
+};
+class Node {
+public:
+  NodeType type;
+  Node() {
+  }
+  virtual ~Node(){};
+};
+
+//Objects are referred to when possible by reference identifier strings
+//to allow for dynamic modules to be loaded and unloaded without requiring recompilation of existing code,
+//and to allow for recompilation of a method if necessary for whatever reason.
+class CallNode:public Node {
+public:
+  std::string methodName;
+  CallNode() {
+    type = NodeType::CallNode;
+  }
+  
+};
+
+
+
+
+
+
 class DeferredOperation {
 public:
   virtual void Run(const asmjit::X86GpVar& output) = 0;
@@ -604,11 +635,11 @@ public:
 	    if(!ResolveType(atype.data())->isStruct) {
 	      
 	    //Copy managed object to stack
-	    JITCompiler->lea(temp,stackmem); //Load effective address of stack memory. 
+	  /*  JITCompiler->lea(temp,stackmem); //Load effective address of stack memory. 
 	    JITCompiler->add(temp,sizeof(size_t)*i);
 	    
 	    JITCompiler->mov(JITCompiler->intptr_ptr(temp),realargs[i]);
-	      mark(temp,true);
+	      mark(temp,true);*/
 	    }
 	  }
 	  
@@ -634,7 +665,7 @@ public:
 	    //Execute write barrier
 	    std::string atype = method->sig.args[i];
 	    if(!ResolveType(atype.data())->isStruct) {
-	      unmark(temp,true);
+	     // unmark(temp,true);
 	    }
 	  }
 	  delete[] realargs;
@@ -685,6 +716,11 @@ public:
 	  asmjit::X86GpVar valreg = JITCompiler->newGpVar();
 	  pop(valreg);
 	  JITCompiler->mov(JITCompiler->intptr_ptr(temp),valreg);
+	  std::string tname = this->locals[index];
+	  if(!ResolveType(tname.data())->isStruct) {
+	    mark(temp,true);
+	  }
+	  
 	  
 	}
 	  break;
@@ -728,7 +764,7 @@ public:
 	  //TODO: Maybe we can defer execution of this whole segment until it is needed somehow?
 	  addInstruction();
 	  
-	  //It's amazing this actually works....
+	  //It's amazing this actually works.... Or doesn't.
 	  DeferredOperation* op = MakeDeferred([=](asmjit::X86GpVar output){
 	    
 	    asmjit::X86GpVar b = JITCompiler->newGpVar();
