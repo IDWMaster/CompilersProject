@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <dlfcn.h>
+#define GC_FAKE
 #include "../GC/GC.h"
 #include <set>
 #include "../asmjit/src/asmjit/asmjit.h"
@@ -271,6 +272,10 @@ static inline void GC_Array_Create(GC_Array_Header*& output, size_t count) {
   output->count = count;
   output->stride = 0;
 }
+
+
+
+
 /**
  * Creates a String from a C-string
  * */
@@ -278,7 +283,7 @@ static inline void GC_String_Create(GC_String_Header*& output, const char* cstr)
   //NOTE: This is out-of-spec. According to the ECMA specification for .NET -- strings should be encoded in UTF-16 format. Also; NULL-terminating the string isn't typical either; but whatever.
   GC_Allocate(sizeof(GC_String_Header)+strlen(cstr)+1,0,(void**)&output,0);
   output->length = strlen(cstr);
-  memcpy(output+1,cstr,strlen(cstr)+1);
+  memcpy(output+1,cstr,output->length+1);
 }
 /**
  * Converts a String to a C-string
@@ -362,7 +367,8 @@ static UALMethod* ResolveMethod(void* assembly, uint32_t handle);
 static std::map<std::string,void*> abi_ext;
 
 static void ConsoleOut(GC_String_Header* str) {
-  printf("%s",GC_String_Cstr(str));
+  const char* mander = GC_String_Cstr(str); //Charmander is a constant. Always.
+  printf("%s",mander);
 }
 static void PrintInt(int eger) {
   printf("%i",eger);
@@ -435,7 +441,10 @@ public:
   MethodSignature sig;
   uint32_t localVarCount;
   std::vector<std::string> locals;
+  
+  
   UALMethod(const BStream& str, void* assembly, const char* sig) {
+    
     this->sig = sig;
     this->str = str;
     this->str.Read(isManaged);
@@ -448,7 +457,6 @@ public:
     }
     this->assembly = assembly;
     nativefunc = 0;
-    
   }
   void Compile() {
     
@@ -484,7 +492,9 @@ public:
     
     
     
-    asmjit::X86Mem locals = JITCompiler->newStack(localVarCount*sizeof(size_t),sizeof(size_t));
+    //Stack size = localVarCount+1 temporary store
+    size_t stackmem_tempoffset = (localVarCount)*sizeof(size_t);
+    asmjit::X86Mem stackmem = JITCompiler->newStack((localVarCount+1)*sizeof(size_t),sizeof(size_t));
     
     
     
@@ -515,23 +525,30 @@ public:
 	   break;
 	 case 1:
 	 {
+	   //TODO: IMPORTANT NOTE:
+	   //We've found the cause of the problem -- NewStack can only be called once per function.
+	   //We need to know the stack size ahead of time.
+	   
+	   
 	   //Load string immediate
 	   //Need to call GC_String_Create with address of C string
-	   asmjit::X86Mem stackmem = JITCompiler->newStack(sizeof(size_t),sizeof(size_t));
 	   asmjit::X86GpVar stackptr = JITCompiler->newGpVar();
 	   asmjit::X86GpVar stringptr = JITCompiler->newGpVar();
 	   JITCompiler->lea(stackptr,stackmem); //Load effective address of stack memory (contains pointer to GC_String_Header)
+	   JITCompiler->add(stackptr,asmjit::imm(stackmem_tempoffset));
+	   
 	   JITCompiler->mov(stringptr,asmjit::imm((size_t)position->value));
+	   printf("Load string:%s:\n",position->value);
 	   asmjit::FuncBuilderX builder;
 	   builder.addArg(asmjit::kVarTypeIntPtr);
 	   builder.addArg(asmjit::kVarTypeIntPtr);
+	   
 	   //Create managed string from C-string
 	   asmjit::X86CallNode* funccall = JITCompiler->call((size_t)&GC_String_Create,asmjit::kFuncConvHost,builder);
 	   funccall->setArg(0,stackptr);
 	   funccall->setArg(1,stringptr);
-	   JITCompiler->mov(stackptr,stackmem);
 	   //MOVE managed object
-	   JITCompiler->mov(location,stackptr); //MOVImm ManagedObject
+	   JITCompiler->mov(location,JITCompiler->intptr_ptr(stackptr)); //MOVImm ManagedObject
 	 }
 	   break;
 	 case 2:
@@ -544,14 +561,14 @@ public:
 	 {
 	   //Pop from local variable
 	   size_t varidx = (size_t)position->value;
-	   JITCompiler->lea(location,locals);
-	   JITCompiler->add(location,varidx*sizeof(size_t));
-	   JITCompiler->mov(location,JITCompiler->intptr_ptr(location));
+	   asmjit::X86GpVar temp = JITCompiler->newGpVar();
+	   JITCompiler->lea(temp,stackmem);
+	   JITCompiler->add(temp,varidx*sizeof(size_t));
+	   JITCompiler->mov(location,JITCompiler->intptr_ptr(temp));
 	 }
 	   break;
 	 case 4:
 	 {
-	   //Deferred operation TODO experimental and VERY unsafe
 	   DeferredOperation* dop = (DeferredOperation*)position->value;
 	   dop->Run(location);
 	   delete dop;
@@ -564,9 +581,8 @@ public:
     auto mark = [&](asmjit::X86GpVar& location, bool isRoot) {
       asmjit::FuncBuilderX builder;
       builder.addArg(asmjit::kVarTypeIntPtr);
-      builder.addArg(asmjit::kVarTypeIntPtr);
+      builder.addArg(asmjit::kVarTypeInt8);
       asmjit::X86CallNode* funccall = JITCompiler->call((size_t)&GC_Mark,asmjit::kFuncConvHost,builder);
-      
       funccall->setArg(0,location);
       funccall->setArg(1,asmjit::imm(isRoot));
       
@@ -574,7 +590,7 @@ public:
     auto unmark = [&](asmjit::X86GpVar& location, bool isRoot) {
       asmjit::FuncBuilderX builder;
       builder.addArg(asmjit::kVarTypeIntPtr);
-      builder.addArg(asmjit::kVarTypeIntPtr);
+      builder.addArg(asmjit::kVarTypeInt8);
       asmjit::X86CallNode* funccall = JITCompiler->call((size_t)&GC_Unmark,asmjit::kFuncConvHost,builder);
       
       funccall->setArg(0,location);
@@ -598,7 +614,6 @@ public:
 	  reader.Read(index);
 	  position->entryType = 0;
 	  position->value = (void*)index;
-	  //TODO: Resolve argument type
 	  std::string tname = sig.args[index];
 	  position->type = ResolveType(tname.data());
 	  position++;
@@ -618,17 +633,11 @@ public:
 	  
 	  
 	  //Stack memory for managed objects. For now; we'll assume that they're all managed.
-	  asmjit::X86Mem stackmem = JITCompiler->newStack(argcount*8,sizeof(size_t));
 	  asmjit::X86GpVar* realargs = new asmjit::X86GpVar[argcount];
 	  
 	    asmjit::X86GpVar temp = JITCompiler->newGpVar();
 	  for(size_t i = 0;i<argcount;i++) {
-	    //Pop arguments off stack
-	    realargs[i] = JITCompiler->newGpVar();
-	    
-	    //TODO: If we're popping a managed object, we have to make a copy of it to the stack, and execute a write barrier.
-	    //For now; we'll assume that everything's managed.
-	    
+	    realargs[i] = JITCompiler->newGpVar();  
 	    pop(realargs[i]);
 	   
 	  }
@@ -692,8 +701,8 @@ public:
 	  reader.Read(index);
 	  
 	  asmjit::X86GpVar temp = JITCompiler->newGpVar();
-	  JITCompiler->lea(temp,locals);
-	  JITCompiler->add(temp,(size_t)(sizeof(size_t)*index));
+	  JITCompiler->lea(temp,stackmem);
+	  JITCompiler->add(temp,asmjit::imm((size_t)(sizeof(size_t)*index)));
 	  //TODO: Write barrier if managed object
 	  asmjit::X86GpVar valreg = JITCompiler->newGpVar();
 	  pop(valreg);
@@ -750,8 +759,8 @@ public:
 	  DeferredOperation* op = MakeDeferred([=](asmjit::X86GpVar output){
 	    
 	    asmjit::X86GpVar b = JITCompiler->newGpVar();
-	    pop(output); //TODO: Problem here -- stack frame issue.
-	    pop(b);
+	    pop(b); //TODO: Problem here -- stack frame issue.
+	    pop(output);
 	    JITCompiler->add(output,b);
 	    
 	  });
@@ -764,23 +773,64 @@ public:
 	  position++;
 	}
 	  break;
+	case 9:
+	{
+	  //BLE!!!!!! (emit barfing sound here into the assembly code)
+	  addInstruction();
+	  asmjit::X86GpVar v0 = JITCompiler->newGpVar();
+	  asmjit::X86GpVar v1 = JITCompiler->newGpVar();
+	  pop(v0);
+	  pop(v1);
+	  JITCompiler->cmp(v1,v0);
+	  uint32_t offset;
+	  reader.Read(offset);
+	  if(UALTox64Offsets.find(offset) != UALTox64Offsets.end()) {
+	    JITCompiler->jle(UALTox64Offsets[offset]);
+	  }else {
+	    asmjit::Label label = JITCompiler->newLabel();
+	    pendingRelocations[offset] = label;
+	    JITCompiler->jle(label);
+	    
+	  }
+	  
+	}
+	  break;
 	case 10:
 	  //NOPE. Not gonna happen.
 	{
 	  addInstruction();
-	  
 	}
 	  break;
-	  
-	case 12:
-	{
-	  //TODO: BNE
+	case 11:
+	  {
+	  //BEQ
 	  addInstruction();
 	  asmjit::X86GpVar v0 = JITCompiler->newGpVar();
 	  asmjit::X86GpVar v1 = JITCompiler->newGpVar();
 	  pop(v0);
 	  pop(v1);
 	  JITCompiler->cmp(v0,v1);
+	  uint32_t offset;
+	  reader.Read(offset);
+	  if(UALTox64Offsets.find(offset) != UALTox64Offsets.end()) {
+	    JITCompiler->je(UALTox64Offsets[offset]);
+	  }else {
+	    asmjit::Label label = JITCompiler->newLabel();
+	    pendingRelocations[offset] = label;
+	    JITCompiler->je(label);
+	    
+	  }
+	}
+	break;
+	case 12:
+	{
+	  //BNE
+	  addInstruction();
+	  asmjit::X86GpVar v0 = JITCompiler->newGpVar();
+	  asmjit::X86GpVar v1 = JITCompiler->newGpVar();
+	  pop(v0);
+	  pop(v1);
+	  JITCompiler->cmp(v1,v0);
 	  uint32_t offset;
 	  reader.Read(offset);
 	  if(UALTox64Offsets.find(offset) != UALTox64Offsets.end()) {
@@ -791,6 +841,118 @@ public:
 	    JITCompiler->jne(label);
 	    
 	  }
+	}
+	  break;
+	  case 13:
+	{
+	  //BGT
+	  addInstruction();
+	  asmjit::X86GpVar v0 = JITCompiler->newGpVar();
+	  asmjit::X86GpVar v1 = JITCompiler->newGpVar();
+	  pop(v0);
+	  pop(v1);
+	  JITCompiler->cmp(v1,v0);
+	  uint32_t offset;
+	  reader.Read(offset);
+	  if(UALTox64Offsets.find(offset) != UALTox64Offsets.end()) {
+	    JITCompiler->jg(UALTox64Offsets[offset]);
+	  }else {
+	    asmjit::Label label = JITCompiler->newLabel();
+	    pendingRelocations[offset] = label;
+	    JITCompiler->jg(label);
+	    
+	  }
+	}
+	  break;
+	  case 14:
+	{
+	  //>=
+	  addInstruction();
+	  asmjit::X86GpVar v0 = JITCompiler->newGpVar();
+	  asmjit::X86GpVar v1 = JITCompiler->newGpVar();
+	  pop(v0);
+	  pop(v1);
+	  JITCompiler->cmp(v1,v0);
+	  uint32_t offset;
+	  reader.Read(offset);
+	  if(UALTox64Offsets.find(offset) != UALTox64Offsets.end()) {
+	    JITCompiler->jge(UALTox64Offsets[offset]);
+	  }else {
+	    asmjit::Label label = JITCompiler->newLabel();
+	    pendingRelocations[offset] = label;
+	    JITCompiler->jge(label);
+	    
+	  }
+	}
+	  break;
+	  case 15:
+	{
+	  //TODO type check
+	  //NOTE: We can only perform addition on native data types; not managed ones.
+	  
+	  
+	  addInstruction();
+	  
+	  DeferredOperation* op = MakeDeferred([=](asmjit::X86GpVar output){
+	    
+	    asmjit::X86GpVar b = JITCompiler->newGpVar();
+	    pop(b); 
+	    pop(output);
+	    JITCompiler->sub(output,b);
+	    
+	  });
+	  
+	  position->entryType = 4;
+	  position->value = op;
+	  
+	  position++;
+	}
+	  break;
+	  case 16:
+	{
+	  //TODO type check
+	  //NOTE: We can only perform addition on native data types; not managed ones.
+	  
+	  
+	  addInstruction();
+	  
+	  DeferredOperation* op = MakeDeferred([=](asmjit::X86GpVar output){
+	    
+	    asmjit::X86GpVar b = JITCompiler->newGpVar();
+	    pop(b); 
+	    pop(output);
+	    JITCompiler->imul(output,b);
+	    
+	  });
+	  
+	  position->entryType = 4;
+	  position->value = op;
+	  
+	  position++;
+	}
+	  break;
+	  case 17:
+	{
+	  //TODO type check
+	  //NOTE: We can only perform addition on native data types; not managed ones.
+	  
+	  
+	  addInstruction();
+	  
+	  DeferredOperation* op = MakeDeferred([=](asmjit::X86GpVar output){
+	    
+	    asmjit::X86GpVar b = JITCompiler->newGpVar();
+	    asmjit::X86GpVar remainder = JITCompiler->newGpVar();
+	    pop(b); 
+	    pop(output);
+	    JITCompiler->idiv(remainder,output,b);
+	    
+	  });
+	  
+	  position->entryType = 4;
+	  position->value = op;
+	  
+	  position++;
 	}
 	  break;
 	default:
@@ -808,9 +970,12 @@ public:
     
     JITCompiler->ret();
     JITCompiler->endFunc();
+    
+    
     nativefunc = (void(*)(GC_Array_Header*))JITCompiler->make();
-    
-    
+    JITCompiler->make();
+    //printf("Wrote %i bytes of code\n",(int)JITCompiler->getAssembler()->getCodeSize());
+    //TODO: How to get size of output code?
   }
   void(*nativefunc)(GC_Array_Header*);
   
@@ -987,6 +1152,9 @@ public:
 	  break;
       }
     }
+  }
+  ~UALMethod() {
+    
   }
 }; 
 
@@ -1180,6 +1348,6 @@ int main(int argc, char** argv) {
   void* ptr = mmap(0,len,PROT_READ,MAP_SHARED,fd,0);
   gc = GC_Init(3);
   UALModule* module = new UALModule(ptr,len);
-  module->LoadMain(argc-1,argv+1);
+  module->LoadMain(argc-2,argv+2);
   return 0;
 }
