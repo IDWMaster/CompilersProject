@@ -797,9 +797,6 @@ public:
 	      JITCompiler->fst(JITCompiler->intptr_ptr(temp));
 	      JITCompiler->mov(output,JITCompiler->intptr_ptr(temp));
 	      
-	      
-	     // printf("TODO: Floating point support\n");
-	     // abort();
 	    }else {
 	      JITCompiler->add(output,b);
 	    }
@@ -938,7 +935,34 @@ public:
 	    asmjit::X86GpVar b = JITCompiler->newGpVar();
 	    pop(b); 
 	    pop(output);
-	    JITCompiler->sub(output,b);
+	     if(GetPosition()->type == ResolveType("System.Double")) {
+	      
+	      //NOTE: The FPU is sort of like a separate processor.
+	      //The FPU has its own set of registers, and can only transfer data through the main memory bus of the chip.
+	      //Therefore it is not possible to transfer values directly from the FPU to CPU registers; or vice-versa.
+	      //So; unfortunately, we will have to transfer from our source registers, to memory, then to the FPU.
+	      //The current optimizing engine won't be able to optimize this out, so floating point operations will be incredibly slow.
+	      //This will be fixed when (and if) I add a new optimizer.
+	      
+	      //Temp 0, 1 = address of temporaries on stack
+	      asmjit::X86GpVar temp = JITCompiler->newGpVar();
+	      JITCompiler->lea(temp,stackmem);
+	      JITCompiler->add(temp,stackmem_tempoffset); //Compute the address of the stack start
+	      JITCompiler->mov(JITCompiler->intptr_ptr(temp),output);
+	      JITCompiler->mov(JITCompiler->intptr_ptr(temp,8),b);
+	      JITCompiler->fld(JITCompiler->intptr_ptr(temp));
+	      JITCompiler->fld(JITCompiler->intptr_ptr(temp,8));
+	      JITCompiler->fsubp(); //Eat your Raspberry Pi.
+	      JITCompiler->fst(JITCompiler->intptr_ptr(temp));
+	      JITCompiler->mov(output,JITCompiler->intptr_ptr(temp));
+	      
+	      
+	     // printf("TODO: Floating point support\n");
+	     // abort();
+	    }else {
+	      JITCompiler->sub(output,b);
+	    }
+	   
 	    
 	  });
 	  
@@ -961,7 +985,34 @@ public:
 	    asmjit::X86GpVar b = JITCompiler->newGpVar();
 	    pop(b); 
 	    pop(output);
-	    JITCompiler->imul(output,b);
+	     if(GetPosition()->type == ResolveType("System.Double")) {
+	      
+	      //NOTE: The FPU is sort of like a separate processor.
+	      //The FPU has its own set of registers, and can only transfer data through the main memory bus of the chip.
+	      //Therefore it is not possible to transfer values directly from the FPU to CPU registers; or vice-versa.
+	      //So; unfortunately, we will have to transfer from our source registers, to memory, then to the FPU.
+	      //The current optimizing engine won't be able to optimize this out, so floating point operations will be incredibly slow.
+	      //This will be fixed when (and if) I add a new optimizer.
+	      
+	      //Temp 0, 1 = address of temporaries on stack
+	      asmjit::X86GpVar temp = JITCompiler->newGpVar();
+	      JITCompiler->lea(temp,stackmem);
+	      JITCompiler->add(temp,stackmem_tempoffset); //Compute the address of the stack start
+	      JITCompiler->mov(JITCompiler->intptr_ptr(temp),output);
+	      JITCompiler->mov(JITCompiler->intptr_ptr(temp,8),b);
+	      JITCompiler->fld(JITCompiler->intptr_ptr(temp));
+	      JITCompiler->fld(JITCompiler->intptr_ptr(temp,8));
+	      JITCompiler->fmulp(); //Eat your Raspberry Pi.
+	      JITCompiler->fst(JITCompiler->intptr_ptr(temp));
+	      JITCompiler->mov(output,JITCompiler->intptr_ptr(temp));
+	      
+	      
+	     // printf("TODO: Floating point support\n");
+	     // abort();
+	    }else {
+	      JITCompiler->imul(output,b);
+	    }
+	   
 	    
 	  });
 	  
@@ -986,10 +1037,25 @@ public:
 	    JITCompiler->xor_(remainder,remainder); //Rename to zero register (as per https://randomascii.wordpress.com/2012/12/29/the-surprising-subtleties-of-zeroing-a-register/)
 	    pop(b); 
 	    pop(output);
-	    JITCompiler->idiv(remainder,output,b); //Yes. The x86_64 div instruction actually works on 128-bit integers......
-	    
+	    if(GetPosition()->type == ResolveType("System.Double")) {
+	      printf("TODO: Floating point division support (how remainder works?).\n");
+	       asmjit::X86GpVar temp = JITCompiler->newGpVar();
+	      JITCompiler->lea(temp,stackmem);
+	      JITCompiler->add(temp,stackmem_tempoffset); //Compute the address of the stack start
+	      JITCompiler->mov(JITCompiler->intptr_ptr(temp),output);
+	      JITCompiler->mov(JITCompiler->intptr_ptr(temp,8),b);
+	      JITCompiler->fld(JITCompiler->intptr_ptr(temp));
+	      JITCompiler->fld(JITCompiler->intptr_ptr(temp,8));
+	      JITCompiler->fdivp();
+	      
+	      JITCompiler->fst(JITCompiler->intptr_ptr(temp));
+	      JITCompiler->mov(output,JITCompiler->intptr_ptr(temp));
+	      
+	      //abort();
+	    }else {
+	      JITCompiler->idiv(remainder,output,b); //Yes. The x86_64 div instruction actually works on 128-bit integers......
+	    }
 	  });
-	  
 	  position->entryType = 4;
 	  position->value = op;
 	  
