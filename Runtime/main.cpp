@@ -370,6 +370,11 @@ static void ConsoleOut(GC_String_Header* str) {
   const char* mander = GC_String_Cstr(str); //Charmander is a constant. Always.
   printf("%s",mander);
 }
+static void PrintDouble(uint64_t encoded) { //Print a double on the double.
+  double onthe = *(double*)&encoded;
+  printf("%f\n",onthe);
+}
+
 static void PrintInt(int eger) {
   printf("%i",eger);
 }
@@ -494,7 +499,7 @@ public:
     
     //Stack size = localVarCount+1 temporary store
     size_t stackmem_tempoffset = (localVarCount)*sizeof(size_t);
-    asmjit::X86Mem stackmem = JITCompiler->newStack((localVarCount+1)*sizeof(size_t),sizeof(size_t));
+    asmjit::X86Mem stackmem = JITCompiler->newStack((localVarCount+2)*sizeof(size_t),sizeof(size_t));
     
     
     
@@ -574,6 +579,13 @@ public:
 	   delete dop;
 	 }
 	   break;
+	 case 5:
+	 {
+	   //We're loading the right values here....
+	   //Load FP immediate
+	   JITCompiler->mov(location,asmjit::imm((uint64_t)position->value));
+	 }
+	   break;
        }
        
     };
@@ -602,6 +614,10 @@ public:
       asmjit::Label retval = JITCompiler->newLabel();
       JITCompiler->bind(retval);
       return retval;
+    };
+    
+    auto GetPosition = [&]() {
+      return position;
     };
     
     while(reader.Read(opcode) != 255) {
@@ -644,8 +660,9 @@ public:
 	  
 	  
 	  for(size_t i = 0;i<argcount;i++) {
-	    methodsig.addArg(asmjit::kVarTypeIntPtr);
-	   
+	    
+	      methodsig.addArg(asmjit::kVarTypeIntPtr);
+	    
 	  }
 	  if(method->nativefunc) {
 	    call = JITCompiler->call((size_t)method->nativefunc,asmjit::kFuncConvHost,methodsig);
@@ -655,8 +672,7 @@ public:
 	    call = JITCompiler->call((size_t)funcptr,asmjit::kFuncConvHost,methodsig);
 	  }
 	  for(size_t i = 0;i<argcount;i++) {
-	    
-	    call->setArg(i,realargs[i]);
+	      call->setArg(i,realargs[i]);
 	  }
 	  
 	  delete[] realargs;
@@ -755,13 +771,38 @@ public:
 	  //TODO: Maybe we can defer execution of this whole segment until it is needed somehow?
 	  addInstruction();
 	  
-	  //It's amazing this actually works.... Or doesn't.
 	  DeferredOperation* op = MakeDeferred([=](asmjit::X86GpVar output){
 	    
 	    asmjit::X86GpVar b = JITCompiler->newGpVar();
-	    pop(b); //TODO: Problem here -- stack frame issue.
+	    pop(b);
 	    pop(output);
-	    JITCompiler->add(output,b);
+	    if(GetPosition()->type == ResolveType("System.Double")) {
+	      
+	      //NOTE: The FPU is sort of like a separate processor.
+	      //The FPU has its own set of registers, and can only transfer data through the main memory bus of the chip.
+	      //Therefore it is not possible to transfer values directly from the FPU to CPU registers; or vice-versa.
+	      //So; unfortunately, we will have to transfer from our source registers, to memory, then to the FPU.
+	      //The current optimizing engine won't be able to optimize this out, so floating point operations will be incredibly slow.
+	      //This will be fixed when (and if) I add a new optimizer.
+	      
+	      //Temp 0, 1 = address of temporaries on stack
+	      asmjit::X86GpVar temp = JITCompiler->newGpVar();
+	      JITCompiler->lea(temp,stackmem);
+	      JITCompiler->add(temp,stackmem_tempoffset); //Compute the address of the stack start
+	      JITCompiler->mov(JITCompiler->intptr_ptr(temp),output);
+	      JITCompiler->mov(JITCompiler->intptr_ptr(temp,8),b);
+	      JITCompiler->fld(JITCompiler->intptr_ptr(temp));
+	      JITCompiler->fld(JITCompiler->intptr_ptr(temp,8));
+	      JITCompiler->faddp(); //Eat your Raspberry Pi.
+	      JITCompiler->fst(JITCompiler->intptr_ptr(temp));
+	      JITCompiler->mov(output,JITCompiler->intptr_ptr(temp));
+	      
+	      
+	     // printf("TODO: Floating point support\n");
+	     // abort();
+	    }else {
+	      JITCompiler->add(output,b);
+	    }
 	    
 	  });
 	  
@@ -769,7 +810,6 @@ public:
 	  //TODO: This is a bad idea. It messes up RSP and causes stuff to be written to the wrong place.
 	  position->entryType = 4;
 	  position->value = op;
-	  
 	  position++;
 	}
 	  break;
@@ -894,7 +934,7 @@ public:
 	  addInstruction();
 	  
 	  DeferredOperation* op = MakeDeferred([=](asmjit::X86GpVar output){
-	    
+	   
 	    asmjit::X86GpVar b = JITCompiler->newGpVar();
 	    pop(b); 
 	    pop(output);
@@ -943,9 +983,10 @@ public:
 	    
 	    asmjit::X86GpVar b = JITCompiler->newGpVar();
 	    asmjit::X86GpVar remainder = JITCompiler->newGpVar();
+	    JITCompiler->xor_(remainder,remainder); //Rename to zero register (as per https://randomascii.wordpress.com/2012/12/29/the-surprising-subtleties-of-zeroing-a-register/)
 	    pop(b); 
 	    pop(output);
-	    JITCompiler->idiv(remainder,output,b);
+	    JITCompiler->idiv(remainder,output,b); //Yes. The x86_64 div instruction actually works on 128-bit integers......
 	    
 	  });
 	  
@@ -955,6 +996,169 @@ public:
 	  position++;
 	}
 	  break;
+	  case 18:
+	{
+	  //TODO type check
+	  //NOTE: We can only perform addition on native data types; not managed ones.
+	  
+	  
+	  addInstruction();
+	  
+	  DeferredOperation* op = MakeDeferred([=](asmjit::X86GpVar output){
+	    
+	    asmjit::X86GpVar b = JITCompiler->newGpVar();
+	    asmjit::X86GpVar remainder = JITCompiler->newGpVar();
+	    JITCompiler->xor_(remainder,remainder); //Rename to zero register (as per https://randomascii.wordpress.com/2012/12/29/the-surprising-subtleties-of-zeroing-a-register/)
+	    pop(b); 
+	    pop(output);
+	    JITCompiler->idiv(remainder,output,b);
+	    JITCompiler->mov(output,remainder);
+	    
+	  });
+	  
+	  position->entryType = 4;
+	  position->value = op;
+	  
+	  position++;
+	}
+	  break;
+	  
+	    case 19:
+	{
+	  
+	  addInstruction();
+	  
+	  DeferredOperation* op = MakeDeferred([=](asmjit::X86GpVar output){
+	    
+	    asmjit::X86GpVar b = JITCompiler->newGpVar();
+	    pop(b); 
+	    pop(output);
+	    JITCompiler->shl(output,b);
+	    
+	  });
+	  
+	  position->entryType = 4;
+	  position->value = op;
+	  
+	  position++;
+	}
+	break;
+	
+	    case 20:
+	{
+	  
+	  addInstruction();
+	  
+	  DeferredOperation* op = MakeDeferred([=](asmjit::X86GpVar output){
+	    
+	    asmjit::X86GpVar b = JITCompiler->newGpVar();
+	    pop(b); 
+	    pop(output);
+	    JITCompiler->shr(output,b);
+	    
+	  });
+	  
+	  position->entryType = 4;
+	  position->value = op;
+	  
+	  position++;
+	}
+	break;  
+	
+	    case 21:
+	{
+	  
+	  addInstruction();
+	  
+	  DeferredOperation* op = MakeDeferred([=](asmjit::X86GpVar output){
+	    
+	    asmjit::X86GpVar b = JITCompiler->newGpVar();
+	    pop(b); 
+	    pop(output);
+	    JITCompiler->and_(output,b);
+	    
+	  });
+	  
+	  position->entryType = 4;
+	  position->value = op;
+	  
+	  position++;
+	}
+	break;  
+	
+	    case 22:
+	{
+	  
+	  addInstruction();
+	  
+	  DeferredOperation* op = MakeDeferred([=](asmjit::X86GpVar output){
+	    
+	    asmjit::X86GpVar b = JITCompiler->newGpVar();
+	    pop(b); 
+	    pop(output);
+	    JITCompiler->or_(output,b);
+	    
+	  });
+	  
+	  position->entryType = 4;
+	  position->value = op;
+	  
+	  position++;
+	}
+	break;  
+	
+	    case 23:
+	{
+	  
+	  addInstruction();
+	  
+	  DeferredOperation* op = MakeDeferred([=](asmjit::X86GpVar output){
+	    
+	    asmjit::X86GpVar b = JITCompiler->newGpVar();
+	    pop(b); 
+	    pop(output);
+	    JITCompiler->xor_(output,b);
+	    
+	  });
+	  
+	  position->entryType = 4;
+	  position->value = op;
+	  
+	  position++;
+	}
+	break;  
+	
+	    case 24:
+	{
+	  
+	  addInstruction();
+	  
+	  DeferredOperation* op = MakeDeferred([=](asmjit::X86GpVar output){
+	    
+	    pop(output);
+	    JITCompiler->not_(output);
+	    
+	  });
+	  
+	  position->entryType = 4;
+	  position->value = op;
+	  
+	  position++;
+	}
+	break;  
+	    case 25:
+	    {
+	      //Load FP immediate
+	      addInstruction();
+	      position->entryType = 5;
+	      position->type = ResolveType("System.Double");
+	      double word; //We read in a doubleword
+	      reader.Read(word);
+	      position->value = (void*)(*(uint64_t*)&word);
+	      position++;
+	    }
+	      break;
+	
 	default:
 	  printf("Unknown OPCODE %i\n",(int)opcode);
 	  goto velociraptor;
@@ -995,163 +1199,7 @@ public:
     }
     nativefunc(arglist);
     return;
-    //Initialize local variables
-    GC_Array_Header* locals;
-    GC_Array_Create(locals,localVarCount);
-    SafeGCHandle handle(&locals);
     
-    void** args = (void**)(arglist+1);
-    StackEntry frame[10]; //No program should EVER need more than 10 frames..... Of course; they said that about RAM way back in the day.....
-    StackEntry* position = frame;
-    
-    BStream reader = str;
-    unsigned char opcode;
-    while(reader.Read(opcode) != 255) {
-      switch(opcode) {
-	case 0:
-	  //TODO: Make this work with things other than Objects.
-	{
-	  uint32_t index;
-	  reader.Read(index);
-	  position->PutObject(args[index]);
-	  position++;
-	}
-	  break;
-	case 1:
-	  //TODO: Call function
-	{
-	  uint32_t funcID;
-	  reader.Read(funcID);
-	  UALMethod* method = ResolveMethod(assembly,funcID);
-	  GC_Array_Header* arguments;
-	  size_t argcount = method->sig.args.size();
-	  GC_Array_Create(arguments,argcount);
-	  for(size_t i = 0;i<argcount;i++) {
-	    //Get arguments from stack
-	    position--;
-	    
-	    GC_Array_Set(arguments,i, position->value);
-	    
-	  }
-	  method->Invoke(arguments);
-	}
-	  break;
-	case 2:
-	{
-	  //Push string onto stack
-	  GC_String_Header* obj;
-	  GC_String_Create(obj,reader.ReadString());
-	  position->PutObject(obj);
-	  position++;
-	}
-	  break;
-	case 3:
-	  //Return
-	  return;
-	  break;
-	case 4:
-	  //Load 32-bit integer
-	{
-	  uint32_t* val;
-	  GC_Allocate(4,0,(void**)&val,0);
-	  reader.Read(*val);
-	  position->PutObject(val);
-	  position++;
-	}
-	  break;
-	case 5:
-	{
-	  //Store local variable
-	  position--;
-	  uint32_t argloc;
-	  reader.Read(argloc);
-	  GC_Array_Set(locals,argloc,position->value);
-	  position->Release();
-	}
-	  break;
-	case 6:
-	  //Jump (unconditional branch)
-	{
-	  uint32_t offset;
-	  reader.Read(offset);
-	  reader.ptr = str.ptr+offset;
-	  reader.len = str.len-offset;
-	}
-	  break;
-	case 7:
-	  //Load local variable
-	{
-	  uint32_t offset;
-	  reader.Read(offset);
-	  position->PutObject(GC_Array_Fetch(locals,offset));
-	  position++;
-	}
-	  break;
-	case 8:
-	{
-	  position-=2;
-	  uint32_t a = *(uint32_t*)(position->value);
-	  uint32_t b = *(uint32_t*)(position[1].value);
-	  position->Release();
-	  position[1].Release();
-	  uint32_t* result;
-	  GC_Allocate(4,0,(void**)&result,0);
-	  *result = a+b;
-	  position->PutObject(result);
-	  position++;
-	}
-	  break;
-	case 9:
-	  //BLE!!!!!!!!! (make barfing sound here)
-	{
-	  uint32_t branchloc;
-	  reader.Read(branchloc);
-	  position-=2;
-	  uint32_t a = *(uint32_t*)(position->value);
-	  uint32_t b = *(uint32_t*)(position[1].value);
-	  position->Release();
-	  position[1].Release();
-	  reader.ptr = a<=b ? str.ptr+branchloc : reader.ptr;
-	  reader.len = a<=b ? str.len-branchloc : reader.len;
-	}
-	  break;
-	case 10:
-	  //NOPE! Not gonna do that!
-	  break;
-	case 11:
-	{
-	  //BEQ
-	  uint32_t branchloc;
-	  reader.Read(branchloc);
-	  position-=2;
-	  uint32_t a = *(uint32_t*)(position->value);
-	  uint32_t b = *(uint32_t*)(position[1].value);
-	  position->Release();
-	  position[1].Release();
-	  reader.ptr = a==b ? str.ptr+branchloc : reader.ptr;
-	  reader.len = a==b ? str.len-branchloc : reader.len;
-	}
-	  break;
-	case 12:
-	{
-	  //BNE
-	  uint32_t branchloc;
-	  reader.Read(branchloc);
-	  position-=2;
-	  uint32_t a = *(uint32_t*)(position->value);
-	  uint32_t b = *(uint32_t*)(position[1].value);
-	  position->Release();
-	  position[1].Release();
-	  reader.ptr = a!=b ? str.ptr+branchloc : reader.ptr;
-	  reader.len = a!=b ? str.len-branchloc : reader.len;
-	}
-	  break;
-	default:
-	  printf("ERR: Illegal OPCODE %i\n",(int)opcode);
-	  abort();
-	  break;
-      }
-    }
   }
   ~UALMethod() {
     
@@ -1321,9 +1369,37 @@ int main(int argc, char** argv) {
   JITruntime = new asmjit::JitRuntime();
   JITCompiler = new asmjit::X86Compiler(JITruntime);
   
+ /* asmjit::FuncBuilderX fbuilder;
+  fbuilder.setRet(asmjit::kVarTypeIntPtr);
+  JITCompiler->addFunc(asmjit::kFuncConvHost,fbuilder);
+  double a = 5.2;
+  double b = 3.2;
+  double answer = -1;
+  asmjit::X86GpVar aaddr = JITCompiler->newGpVar();
+  asmjit::X86GpVar baddr = JITCompiler->newGpVar();
+  asmjit::X86GpVar answeraddr = JITCompiler->newGpVar();
+  
+  JITCompiler->mov(aaddr,asmjit::imm((size_t)(void*)&a));
+  JITCompiler->mov(baddr,(size_t)&b);
+  JITCompiler->mov(answeraddr,(size_t)&answer);
+  JITCompiler->fld(JITCompiler->intptr_ptr(aaddr));
+  JITCompiler->fld(JITCompiler->intptr_ptr(baddr));
+  JITCompiler->faddp();
+  JITCompiler->fst(JITCompiler->intptr_ptr(answeraddr));
+  JITCompiler->ret();
+  JITCompiler->endFunc();
+  void(*fptr)() = (void(*)())JITCompiler->make();
+  fptr();
+  
+  printf("%f\n",answer);
+  
+  
+  return 0;*/
   //Register built-ins
   abi_ext["ConsoleOut"] = (void*)ConsoleOut;
   abi_ext["PrintInt"] = (void*)PrintInt;
+  abi_ext["PrintDouble"] = (void*)PrintDouble;
+  
   UALType* btype = new UALType();
   btype->isStruct = true;
   btype->size = 4; //32-bit integer.
@@ -1334,6 +1410,12 @@ int main(int argc, char** argv) {
   btype->size = sizeof(size_t); //A String just has a single pointer.
   btype->name = "System.String";
   typeCache["System.String"] = btype;
+  btype = new UALType();
+  btype->isStruct = true;
+  btype->size = 8;
+  btype->name = "System.Double";
+  typeCache["System.Double"] = btype;
+  
   
   int fd = 0;
   if(argc>1) {
