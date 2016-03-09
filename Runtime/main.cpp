@@ -446,10 +446,10 @@ public:
   MethodSignature sig;
   uint32_t localVarCount;
   std::vector<std::string> locals;
-  
+  asmjit::X86Compiler* JITCompiler;
   
   UALMethod(const BStream& str, void* assembly, const char* sig) {
-    
+    this->JITCompiler = new asmjit::X86Compiler(JITruntime);
     this->sig = sig;
     this->str = str;
     this->str.Read(isManaged);
@@ -655,7 +655,6 @@ public:
 	  for(size_t i = 0;i<argcount;i++) {
 	    realargs[i] = JITCompiler->newGpVar();  
 	    pop(realargs[i]);
-	   
 	  }
 	  
 	  
@@ -665,6 +664,8 @@ public:
 	    
 	  }
 	  if(method->nativefunc) {
+	    
+	    printf("EXPERIMENTAL: Invoke managed function\n");
 	    call = JITCompiler->call((size_t)method->nativefunc,asmjit::kFuncConvHost,methodsig);
 	  }else {
 	    //call = JITCompiler->call()
@@ -1038,7 +1039,6 @@ public:
 	    pop(b); 
 	    pop(output);
 	    if(GetPosition()->type == ResolveType("System.Double")) {
-	      printf("TODO: Floating point division support (how remainder works?).\n");
 	       asmjit::X86GpVar temp = JITCompiler->newGpVar();
 	      JITCompiler->lea(temp,stackmem);
 	      JITCompiler->add(temp,stackmem_tempoffset); //Compute the address of the stack start
@@ -1046,7 +1046,7 @@ public:
 	      JITCompiler->mov(JITCompiler->intptr_ptr(temp,8),b);
 	      JITCompiler->fld(JITCompiler->intptr_ptr(temp));
 	      JITCompiler->fld(JITCompiler->intptr_ptr(temp,8));
-	      JITCompiler->fdivp();
+	      JITCompiler->fdivp(); //NOTE: Remember the famous FDIV bug in the Pentium chip?
 	      
 	      JITCompiler->fst(JITCompiler->intptr_ptr(temp));
 	      JITCompiler->mov(output,JITCompiler->intptr_ptr(temp));
@@ -1268,7 +1268,7 @@ public:
     
   }
   ~UALMethod() {
-    
+    delete JITCompiler;
   }
 }; 
 
