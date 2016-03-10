@@ -510,12 +510,25 @@ public:
 class BinaryExpression:public Node {
 public:
   char op;
+  //OPS
+  //+ -- Addition
+  //- -- Subtraction
+  //* -- Multiplication
+  /// -- Division
+  //% -- Reminder
+  //< -- Shift left
+  //> -- Shift right
+  //& -- AND
+  //| -- OR
+  //! -- NOT (only needs Democratic debate)
+  //~ -- XOR
   Node* left;
   Node* right;
   BinaryExpression(char op, Node* democrat, Node* republican):Node(NBinaryExpression) {
     this->op = op;
     left = democrat;
     right = republican;
+    this->resultType = left->resultType;
   }
 };
 
@@ -557,6 +570,7 @@ public:
   
   //BEGIN Optimization engine:
   std::vector<Node*> nodes;
+    std::vector<Node*> stack;
   Node* instructions;
   Node* lastInstruction;
   template<typename T, typename... arg>
@@ -578,6 +592,7 @@ public:
   T* Node_Stackop(arg... uments) {
     T* retval = new T(uments...);
     nodes.push_back(retval);
+    stack.push_back(retval);
     return retval;
   }
   template<typename T>
@@ -667,7 +682,6 @@ public:
     StackEntry* position = frame;
     
     
-    std::vector<Node*> stack;
     
     //Calling convention:
     //Each argument is word size of processor
@@ -793,7 +807,6 @@ public:
 	  position->type = ResolveType(tname.data());
 	  position++;
 	  Node* sobj = Node_Stackop<LdArg>(index,tname.data());
-	  stack.push_back(sobj);
 	  
 	  
 	}
@@ -856,7 +869,6 @@ public:
 	    Node_RemoveInstruction(args[i]);
 	  }
 	  Node* sobj = Node_Instruction<CallNode>(method,args);
-	  stack.push_back(sobj);
 	  
 	  
 	}
@@ -872,7 +884,7 @@ public:
 	  position++;
 	  
 	  Node* sobj = Node_Stackop<ConstantString>((const char*)position->value);
-	  stack.push_back(sobj);
+	  
 	}
 	  break;
 	case 3:
@@ -885,7 +897,8 @@ public:
 	    //There should be nothing on stack
 	    if(stack.size()) {
 	      throw "Malformed UAL. Function should not return a value.";
-	    }else {
+	    }
+	  }else {
 	      if(stack.size() != 1) {
 		throw "Malformed UAL. Function must return a value.";
 	      }
@@ -893,9 +906,8 @@ public:
 		throw "Malformed UAL. Function does not return correct datatype.";
 	      }
 	      Node_Instruction<Ret>(Node_RemoveInstruction(stack[0]));
-	      stack.pop_back();
+	      
 	    }
-	  }
 	}
 	  break;
 	case 4:
@@ -937,6 +949,7 @@ public:
 	  Node* sval = stack[stack.size()-1];
 	  stack.pop_back();
 	  if(sval->resultType != this->locals[index]) {
+	    printf("Type mismatch %s != %s\n",sval->resultType.data(),this->locals[index].data());
 	    throw "Malformed UAL. Type mismatch on store to local variable.";
 	  }
 	  Node_Instruction<StLoc>(index,Node_RemoveInstruction(sval));
@@ -1042,7 +1055,7 @@ public:
 	  if(!(left->resultType == "System.Double" || left->resultType == "System.Int32")) {
 	    throw "Malformed UAL. Binary expressions can only operate on primitive types.";
 	  }
-	  Node_Instruction<BinaryExpression>('+',Node_RemoveInstruction(left),Node_RemoveInstruction(right));
+	  Node_Stackop<BinaryExpression>('+',Node_RemoveInstruction(left),Node_RemoveInstruction(right));
 	  
 	  
 	}
@@ -1303,7 +1316,7 @@ public:
 	  if(!(left->resultType == "System.Double" || left->resultType == "System.Int32")) {
 	    throw "Malformed UAL. Binary expressions can only operate on primitive types.";
 	  }
-	  Node_Instruction<BinaryExpression>('-',Node_RemoveInstruction(left),Node_RemoveInstruction(right));
+	  Node_Stackop<BinaryExpression>('-',Node_RemoveInstruction(left),Node_RemoveInstruction(right));
 	  
 	  
 	  
@@ -1373,7 +1386,7 @@ public:
 	  if(!(left->resultType == "System.Double" || left->resultType == "System.Int32")) {
 	    throw "Malformed UAL. Binary expressions can only operate on primitive types.";
 	  }
-	  Node_Instruction<BinaryExpression>('*',Node_RemoveInstruction(left),Node_RemoveInstruction(right));
+	  Node_Stackop<BinaryExpression>('*',Node_RemoveInstruction(left),Node_RemoveInstruction(right));
 	  
 	}
 	  break;
@@ -1430,7 +1443,7 @@ public:
 	  if(!(left->resultType == "System.Double" || left->resultType == "System.Int32")) {
 	    throw "Malformed UAL. Binary expressions can only operate on primitive types.";
 	  }
-	  Node_Instruction<BinaryExpression>('/',Node_RemoveInstruction(left),Node_RemoveInstruction(right));
+	  Node_Stackop<BinaryExpression>('/',Node_RemoveInstruction(left),Node_RemoveInstruction(right));
 	  
 	  
 	}
@@ -1475,7 +1488,7 @@ public:
 	  if(!(left->resultType == "System.Int32")) {
 	    throw "Malformed UAL. Binary expressions can only operate on primitive types.";
 	  }
-	  Node_Instruction<BinaryExpression>('%',Node_RemoveInstruction(left),Node_RemoveInstruction(right));
+	  Node_Stackop<BinaryExpression>('%',Node_RemoveInstruction(left),Node_RemoveInstruction(right));
 	  
 	  
 	}
@@ -1501,6 +1514,21 @@ public:
 	  position++;
 	  
 	  
+	  if(stack.size() < 2) {
+	    throw "Malformed UAL. Expected two operands on stack.";
+	  }
+	  Node* left = stack[stack.size()-1];
+	  stack.pop_back();
+	  Node* right = stack[stack.size()-1];
+	  stack.pop_back();
+	  if(left->resultType != right->resultType) {
+	    throw "Malformed UAL. Binary expressions require operands to be of same type.";
+	  }
+	  if(!(left->resultType == "System.Int32")) {
+	    throw "Malformed UAL. Binary expressions can only operate on primitive types.";
+	  }
+	  Node_Stackop<BinaryExpression>('<',Node_RemoveInstruction(left),Node_RemoveInstruction(right));
+	  
 	  
 	  
 	  
@@ -1525,6 +1553,25 @@ public:
 	  position->value = op;
 	  
 	  position++;
+	  
+	  
+	  
+	  if(stack.size() < 2) {
+	    throw "Malformed UAL. Expected two operands on stack.";
+	  }
+	  Node* left = stack[stack.size()-1];
+	  stack.pop_back();
+	  Node* right = stack[stack.size()-1];
+	  stack.pop_back();
+	  if(left->resultType != right->resultType) {
+	    throw "Malformed UAL. Binary expressions require operands to be of same type.";
+	  }
+	  if(!(left->resultType == "System.Int32")) {
+	    throw "Malformed UAL. Binary expressions can only operate on primitive types.";
+	  }
+	  Node_Stackop<BinaryExpression>('>',Node_RemoveInstruction(left),Node_RemoveInstruction(right));
+	  
+	  
 	}
 	break;  
 	
@@ -1546,6 +1593,24 @@ public:
 	  position->value = op;
 	  
 	  position++;
+	  
+	  
+	  
+	  if(stack.size() < 2) {
+	    throw "Malformed UAL. Expected two operands on stack.";
+	  }
+	  Node* left = stack[stack.size()-1];
+	  stack.pop_back();
+	  Node* right = stack[stack.size()-1];
+	  stack.pop_back();
+	  if(left->resultType != right->resultType) {
+	    throw "Malformed UAL. Binary expressions require operands to be of same type.";
+	  }
+	  if(!(left->resultType == "System.Int32")) {
+	    throw "Malformed UAL. Binary expressions can only operate on primitive types.";
+	  }
+	  Node_Stackop<BinaryExpression>('&',Node_RemoveInstruction(left),Node_RemoveInstruction(right));
+	  
 	}
 	break;  
 	
@@ -1567,6 +1632,24 @@ public:
 	  position->value = op;
 	  
 	  position++;
+	  
+	  
+	  
+	  if(stack.size() < 2) {
+	    throw "Malformed UAL. Expected two operands on stack.";
+	  }
+	  Node* left = stack[stack.size()-1];
+	  stack.pop_back();
+	  Node* right = stack[stack.size()-1];
+	  stack.pop_back();
+	  if(left->resultType != right->resultType) {
+	    throw "Malformed UAL. Binary expressions require operands to be of same type.";
+	  }
+	  if(!(left->resultType == "System.Int32")) {
+	    throw "Malformed UAL. Binary expressions can only operate on primitive types.";
+	  }
+	  Node_Stackop<BinaryExpression>('|',Node_RemoveInstruction(left),Node_RemoveInstruction(right));
+	  
 	}
 	break;  
 	
@@ -1588,6 +1671,24 @@ public:
 	  position->value = op;
 	  
 	  position++;
+	  
+	  
+	  
+	  if(stack.size() < 2) {
+	    throw "Malformed UAL. Expected two operands on stack.";
+	  }
+	  Node* left = stack[stack.size()-1];
+	  stack.pop_back();
+	  Node* right = stack[stack.size()-1];
+	  stack.pop_back();
+	  if(left->resultType != right->resultType) {
+	    throw "Malformed UAL. Binary expressions require operands to be of same type.";
+	  }
+	  if(!(left->resultType == "System.Int32")) {
+	    throw "Malformed UAL. Binary expressions can only operate on primitive types.";
+	  }
+	  Node_Stackop<BinaryExpression>('~',Node_RemoveInstruction(left),Node_RemoveInstruction(right));
+	  
 	}
 	break;  
 	
@@ -1607,6 +1708,18 @@ public:
 	  position->value = op;
 	  
 	  position++;
+	  
+	  
+	  
+	  if(stack.size() < 1) {
+	    throw "Malformed UAL. Expected at least one operand on the stack.";
+	  }
+	  Node* left = stack[stack.size()-1];
+	  if(!(left->resultType == "System.Int32")) {
+	    throw "Malformed UAL. Binary expressions can only operate on primitive types.";
+	  }
+	  Node_Stackop<BinaryExpression>('!',Node_RemoveInstruction(left),(Node*)0);
+	  
 	}
 	break;  
 	    case 25:
