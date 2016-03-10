@@ -390,26 +390,133 @@ Type* ResolveType(const char* name);
 //A parse tree node
 
 enum NodeType {
-  CallNode
+  NCallNode, NConstantInt, NConstantDouble, NConstantString, NLdLoc, NStLoc, NLdArg, NRet, NBranch, NBinaryExpression
 };
 class Node {
 public:
   NodeType type;
-  Node() {
+  std::string resultType;
+  Node* next;
+  Node* prev;
+  Node(NodeType type) {
+    this->type = type;
+    this->next = 0;
+    this->prev = 0;
   }
   virtual ~Node(){};
 };
+
+class ConstantInt:public Node {
+public:
+  uint32_t value;
+  ConstantInt(uint32_t val):Node(NodeType::NConstantInt) {
+    value = val;
+    resultType = "System.Int32";
+  }
+};
+class ConstantDouble:public Node {
+public:
+  double value;
+  ConstantDouble(double val):Node(NodeType::NConstantDouble) {
+    this->value = val;
+    resultType = "System.Double";
+  }
+};
+
+class ConstantString:public Node {
+public:
+  const char* value;
+  ConstantString(const char* val):Node(NodeType::NConstantString) {
+    this->value = val;
+    resultType = "System.String";
+  }
+};
+
+class LdLoc:public Node {
+public:
+  size_t idx; //The index of the local field to load from
+  LdLoc(size_t idx, const char* type):Node(NodeType::NLdLoc) {
+    this->idx = idx;
+    this->resultType = type;
+  }
+};
+class StLoc:public Node {
+public:
+  size_t idx;
+  Node* exp; //The expression to store into the variable.
+  StLoc(size_t idx, Node* exp):Node(NodeType::NStLoc) {
+    this->idx = idx;
+    this->exp = exp;
+  }
+};
+
+class LdArg:public Node {
+public:
+  size_t index;
+  LdArg(size_t index, const char* type):Node(NodeType::NLdArg) {
+    this->index = index;
+    this->resultType = type;
+  }
+};
+
+class Ret:public Node {
+public:
+  Node* resultExpression;
+  Ret(Node* resultExpression):Node(NRet) {
+    this->resultExpression = resultExpression;
+  }
+};
+enum BranchCondition {
+  UnconditionalSurrender, //Complete and unconditional branch.
+  Ble, //Barf
+  Blt, //Bacon, Lettuce, and Tomato
+  Bgt, //Bacon, Gravy, and Tomato.,
+  Bge, //Branch on greater than or equal to
+  Beq, //Branch on equal
+  Bne //Branch on not equal
+  
+};
+class Branch:public Node {
+public:
+  Node* left; //Democratic operand on comparison
+  Node* right; //Republican operand on comparison
+  uint32_t offset; //Byte offset from start of executable segment of method.
+  BranchCondition condition;
+  Branch(uint32_t ualoffset, BranchCondition condition, Node* democrat, Node* republican):Node(NBranch) {
+    offset = ualoffset;
+    this->condition = condition;
+    left = democrat;
+    right = republican;
+  }
+};
+
+
 
 //Objects are referred to when possible by reference identifier strings
 //to allow for dynamic modules to be loaded and unloaded without requiring recompilation of existing code,
 //and to allow for recompilation of a method if necessary for whatever reason.
 class CallNode:public Node {
 public:
-  std::string methodName;
-  CallNode() {
-    type = NodeType::CallNode;
+  UALMethod* method;
+  std::vector<Node*> arguments;
+  CallNode(UALMethod* method, const std::vector<Node*>& arguments):Node(NodeType::NCallNode) {
+    this->method = method;
+    this->arguments = arguments;
   }
   
+};
+
+
+class BinaryExpression:public Node {
+public:
+  char op;
+  Node* left;
+  Node* right;
+  BinaryExpression(char op, Node* democrat, Node* republican):Node(NBinaryExpression) {
+    this->op = op;
+    left = democrat;
+    right = republican;
+  }
 };
 
 
@@ -448,7 +555,57 @@ public:
   std::vector<std::string> locals;
   asmjit::X86Compiler* JITCompiler;
   
+  //BEGIN Optimization engine:
+  std::vector<Node*> nodes;
+  Node* instructions;
+  Node* lastInstruction;
+  template<typename T, typename... arg>
+  //Adds an Instruction node to the tree
+  T* Node_Instruction(arg... uments) {
+    T* retval = new T(uments...);
+    nodes.push_back(retval);
+    if(instructions == 0) {
+      instructions = retval;
+      lastInstruction = retval;
+    }else {
+      lastInstruction->next = retval;
+      retval->prev = lastInstruction;
+      lastInstruction = retval;
+    }
+    return retval;
+  }
+  template<typename T, typename... arg>
+  T* Node_Stackop(arg... uments) {
+    T* retval = new T(uments...);
+    nodes.push_back(retval);
+    return retval;
+  }
+  template<typename T>
+  //Removes an instruction node
+  T* Node_RemoveInstruction(T* node) {
+    if(node->prev) {
+      node->prev->next = node->next;
+    }
+    if(node->next) {
+      node->next->prev = node->prev;
+    }
+    if(node == instructions) {
+      instructions = node->next;
+    }
+    if(node == lastInstruction) {
+      lastInstruction = node->prev;
+    }
+    
+    node->next = 0;
+    node->prev = 0;
+    return node;
+  }
+  //END Optimization engine
+  
+  
+  
   UALMethod(const BStream& str, void* assembly, const char* sig) {
+    this->instructions = 0;
     this->JITCompiler = new asmjit::X86Compiler(JITruntime);
     this->sig = sig;
     this->str = str;
@@ -509,6 +666,8 @@ public:
     StackEntry frame[10];
     StackEntry* position = frame;
     
+    
+    std::vector<Node*> stack;
     
     //Calling convention:
     //Each argument is word size of processor
@@ -633,6 +792,10 @@ public:
 	  std::string tname = sig.args[index];
 	  position->type = ResolveType(tname.data());
 	  position++;
+	  Node* sobj = Node_Stackop<LdArg>(index,tname.data());
+	  stack.push_back(sobj);
+	  
+	  
 	}
 	  break;
 	case 1:
@@ -676,7 +839,25 @@ public:
 	      call->setArg(i,realargs[i]);
 	  }
 	  
+	  
+	  
 	  delete[] realargs;
+	  std::vector<Node*> args;
+	  args.resize(argcount);
+	  for(size_t i = 0;i<argcount;i++) {
+	    if(stack.size() == 0) {
+	      throw "Malformed UAL. Too few arguments in function call.";
+	    }
+	    args[i] = stack[stack.size()-1];
+	    if(args[i]->resultType != method->sig.args[i]) {
+	      throw "Malformed UAL. Illegal data type passed to function.";
+	    }
+	    stack.pop_back();
+	    Node_RemoveInstruction(args[i]);
+	  }
+	  Node* sobj = Node_Instruction<CallNode>(method,args);
+	  stack.push_back(sobj);
+	  
 	  
 	}
 	  break;
@@ -689,6 +870,9 @@ public:
 	  position->entryType = 1; //Load string
 	  position->type = ResolveType("System.String");
 	  position++;
+	  
+	  Node* sobj = Node_Stackop<ConstantString>((const char*)position->value);
+	  stack.push_back(sobj);
 	}
 	  break;
 	case 3:
@@ -696,6 +880,22 @@ public:
 	  //RET
 	  JITCompiler->ret();
 	  
+	  
+	  if(this->sig.returnType == "System.Void") {
+	    //There should be nothing on stack
+	    if(stack.size()) {
+	      throw "Malformed UAL. Function should not return a value.";
+	    }else {
+	      if(stack.size() != 1) {
+		throw "Malformed UAL. Function must return a value.";
+	      }
+	      if(stack[0]->resultType != this->sig.returnType) {
+		throw "Malformed UAL. Function does not return correct datatype.";
+	      }
+	      Node_Instruction<Ret>(Node_RemoveInstruction(stack[0]));
+	      stack.pop_back();
+	    }
+	  }
 	}
 	  break;
 	case 4:
@@ -708,6 +908,7 @@ public:
 	  position->type = ResolveType("System.Int32");
 	  position->value = (void*)(uint64_t)val;
 	  position++;
+	  Node_Stackop<ConstantInt>(val);
 	}
 	  break;
 	case 5:
@@ -729,6 +930,18 @@ public:
 	    mark(temp,true);
 	  }
 	  
+	  //Store value to local
+	  if(stack.size() == 0) {
+	    throw "Malformed UAL. Expected value on stack.";
+	  }
+	  Node* sval = stack[stack.size()-1];
+	  stack.pop_back();
+	  if(sval->resultType != this->locals[index]) {
+	    throw "Malformed UAL. Type mismatch on store to local variable.";
+	  }
+	  Node_Instruction<StLoc>(index,Node_RemoveInstruction(sval));
+	  
+	  
 	  
 	}
 	  break;
@@ -747,6 +960,9 @@ public:
 	  }else {
 	    JITCompiler->jmp(UALTox64Offsets[offset]); //Make Link jump! (NO!!!!! It's Zelda!)
 	   }
+	   
+	   Node_Instruction<Branch>(offset, UnconditionalSurrender, (Node*)0, (Node*)0);
+	   
 	}
 	  break;
 	case 7:
@@ -761,6 +977,8 @@ public:
 	  std::string tname = this->locals[id];
 	  position->type = ResolveType(tname.data());
 	  position++;
+	  
+	  Node_Stackop<LdLoc>(id,tname.data());
 	}
 	  break;
 	case 8:
@@ -809,6 +1027,24 @@ public:
 	  position->entryType = 4;
 	  position->value = op;
 	  position++;
+	  
+	  
+	  if(stack.size() < 2) {
+	    throw "Malformed UAL. Expected two operands on stack.";
+	  }
+	  Node* left = stack[stack.size()-1];
+	  stack.pop_back();
+	  Node* right = stack[stack.size()-1];
+	  stack.pop_back();
+	  if(left->resultType != right->resultType) {
+	    throw "Malformed UAL. Binary expressions require operands to be of same type.";
+	  }
+	  if(!(left->resultType == "System.Double" || left->resultType == "System.Int32")) {
+	    throw "Malformed UAL. Binary expressions can only operate on primitive types.";
+	  }
+	  Node_Instruction<BinaryExpression>('+',Node_RemoveInstruction(left),Node_RemoveInstruction(right));
+	  
+	  
 	}
 	  break;
 	case 9:
@@ -830,6 +1066,19 @@ public:
 	    JITCompiler->jle(label);
 	    
 	  }
+	  
+	  if(stack.size()<2) {
+	    throw "Malformed UAL. Comparison expressions must use BOTH a Democrat and a Republican.";
+	  }
+	  Node* left = stack[stack.size()-1];
+	  stack.pop_back();
+	  Node* right = stack[stack.size()-1];
+	  stack.pop_back();
+	  
+	  if(left->resultType != right->resultType) {
+	    throw "Malformed UAL. Type mismatch in conditional branch.";
+	  }
+	  Node_Instruction<Branch>(offset,Ble,Node_RemoveInstruction(left),Node_RemoveInstruction(right));
 	  
 	}
 	  break;
@@ -858,6 +1107,23 @@ public:
 	    JITCompiler->je(label);
 	    
 	  }
+	  
+	  
+	  
+	  
+	  
+	  if(stack.size()<2) {
+	    throw "Malformed UAL. Comparison expressions must use BOTH a Democrat and a Republican.";
+	  }
+	  Node* left = stack[stack.size()-1];
+	  stack.pop_back();
+	  Node* right = stack[stack.size()-1];
+	  stack.pop_back();
+	  
+	  if(left->resultType != right->resultType) {
+	    throw "Malformed UAL. Type mismatch in conditional branch.";
+	  }
+	  Node_Instruction<Branch>(offset,Beq,Node_RemoveInstruction(left),Node_RemoveInstruction(right));
 	}
 	break;
 	case 12:
@@ -879,6 +1145,21 @@ public:
 	    JITCompiler->jne(label);
 	    
 	  }
+	  
+	  
+	  
+	  if(stack.size()<2) {
+	    throw "Malformed UAL. Comparison expressions must use BOTH a Democrat and a Republican.";
+	  }
+	  Node* left = stack[stack.size()-1];
+	  stack.pop_back();
+	  Node* right = stack[stack.size()-1];
+	  stack.pop_back();
+	  
+	  if(left->resultType != right->resultType) {
+	    throw "Malformed UAL. Type mismatch in conditional branch.";
+	  }
+	  Node_Instruction<Branch>(offset,Bne,Node_RemoveInstruction(left),Node_RemoveInstruction(right));
 	}
 	  break;
 	  case 13:
@@ -900,6 +1181,23 @@ public:
 	    JITCompiler->jg(label);
 	    
 	  }
+	  
+	  
+	  
+	  if(stack.size()<2) {
+	    throw "Malformed UAL. Comparison expressions must use BOTH a Democrat and a Republican.";
+	  }
+	  Node* left = stack[stack.size()-1];
+	  stack.pop_back();
+	  Node* right = stack[stack.size()-1];
+	  stack.pop_back();
+	  
+	  if(left->resultType != right->resultType) {
+	    throw "Malformed UAL. Type mismatch in conditional branch.";
+	  }
+	  Node_Instruction<Branch>(offset,Bgt,Node_RemoveInstruction(left),Node_RemoveInstruction(right));
+	  
+	  
 	}
 	  break;
 	  case 14:
@@ -921,6 +1219,21 @@ public:
 	    JITCompiler->jge(label);
 	    
 	  }
+	  
+	  
+	  
+	  if(stack.size()<2) {
+	    throw "Malformed UAL. Comparison expressions must use BOTH a Democrat and a Republican.";
+	  }
+	  Node* left = stack[stack.size()-1];
+	  stack.pop_back();
+	  Node* right = stack[stack.size()-1];
+	  stack.pop_back();
+	  
+	  if(left->resultType != right->resultType) {
+	    throw "Malformed UAL. Type mismatch in conditional branch.";
+	  }
+	  Node_Instruction<Branch>(offset,Bge,Node_RemoveInstruction(left),Node_RemoveInstruction(right));
 	}
 	  break;
 	  case 15:
@@ -964,6 +1277,9 @@ public:
 	      JITCompiler->sub(output,b);
 	    }
 	   
+	   
+	   
+	   
 	    
 	  });
 	  
@@ -971,6 +1287,26 @@ public:
 	  position->value = op;
 	  
 	  position++;
+	  
+	  
+	  
+	  if(stack.size() < 2) {
+	    throw "Malformed UAL. Expected two operands on stack.";
+	  }
+	  Node* left = stack[stack.size()-1];
+	  stack.pop_back();
+	  Node* right = stack[stack.size()-1];
+	  stack.pop_back();
+	  if(left->resultType != right->resultType) {
+	    throw "Malformed UAL. Binary expressions require operands to be of same type.";
+	  }
+	  if(!(left->resultType == "System.Double" || left->resultType == "System.Int32")) {
+	    throw "Malformed UAL. Binary expressions can only operate on primitive types.";
+	  }
+	  Node_Instruction<BinaryExpression>('-',Node_RemoveInstruction(left),Node_RemoveInstruction(right));
+	  
+	  
+	  
 	}
 	  break;
 	  case 16:
@@ -1021,6 +1357,24 @@ public:
 	  position->value = op;
 	  
 	  position++;
+	  
+	  
+	  
+	  if(stack.size() < 2) {
+	    throw "Malformed UAL. Expected two operands on stack.";
+	  }
+	  Node* left = stack[stack.size()-1];
+	  stack.pop_back();
+	  Node* right = stack[stack.size()-1];
+	  stack.pop_back();
+	  if(left->resultType != right->resultType) {
+	    throw "Malformed UAL. Binary expressions require operands to be of same type.";
+	  }
+	  if(!(left->resultType == "System.Double" || left->resultType == "System.Int32")) {
+	    throw "Malformed UAL. Binary expressions can only operate on primitive types.";
+	  }
+	  Node_Instruction<BinaryExpression>('*',Node_RemoveInstruction(left),Node_RemoveInstruction(right));
+	  
 	}
 	  break;
 	  case 17:
@@ -1060,6 +1414,25 @@ public:
 	  position->value = op;
 	  
 	  position++;
+	  
+	  
+	  
+	  if(stack.size() < 2) {
+	    throw "Malformed UAL. Expected two operands on stack.";
+	  }
+	  Node* left = stack[stack.size()-1];
+	  stack.pop_back();
+	  Node* right = stack[stack.size()-1];
+	  stack.pop_back();
+	  if(left->resultType != right->resultType) {
+	    throw "Malformed UAL. Binary expressions require operands to be of same type.";
+	  }
+	  if(!(left->resultType == "System.Double" || left->resultType == "System.Int32")) {
+	    throw "Malformed UAL. Binary expressions can only operate on primitive types.";
+	  }
+	  Node_Instruction<BinaryExpression>('/',Node_RemoveInstruction(left),Node_RemoveInstruction(right));
+	  
+	  
 	}
 	  break;
 	  case 18:
@@ -1086,6 +1459,25 @@ public:
 	  position->value = op;
 	  
 	  position++;
+	  
+	  
+	  
+	  if(stack.size() < 2) {
+	    throw "Malformed UAL. Expected two operands on stack.";
+	  }
+	  Node* left = stack[stack.size()-1];
+	  stack.pop_back();
+	  Node* right = stack[stack.size()-1];
+	  stack.pop_back();
+	  if(left->resultType != right->resultType) {
+	    throw "Malformed UAL. Binary expressions require operands to be of same type.";
+	  }
+	  if(!(left->resultType == "System.Int32")) {
+	    throw "Malformed UAL. Binary expressions can only operate on primitive types.";
+	  }
+	  Node_Instruction<BinaryExpression>('%',Node_RemoveInstruction(left),Node_RemoveInstruction(right));
+	  
+	  
 	}
 	  break;
 	  
@@ -1107,6 +1499,11 @@ public:
 	  position->value = op;
 	  
 	  position++;
+	  
+	  
+	  
+	  
+	  
 	}
 	break;
 	
@@ -1222,6 +1619,11 @@ public:
 	      reader.Read(word);
 	      position->value = (void*)(*(uint64_t*)&word);
 	      position++;
+	      
+	      
+	      
+	      Node_Stackop<ConstantDouble>(word);
+	      
 	    }
 	      break;
 	
@@ -1269,6 +1671,10 @@ public:
   }
   ~UALMethod() {
     delete JITCompiler;
+    size_t l = nodes.size();
+    for(size_t i = 0;i<l;i++) {
+      delete nodes[i];
+    }
   }
 }; 
 
@@ -1305,6 +1711,7 @@ public:
       
       void* ptr = bstr.Increment(mlen);
       UALMethod* method = new UALMethod(BStream(ptr,mlen),module,mname);
+      method->sig = mname;
       methods[mname] = method;
       methodCache[mname] = method;
     }
