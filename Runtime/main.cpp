@@ -11,7 +11,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <dlfcn.h>
-//#define GC_FAKE
+#define GC_FAKE
 #include "../GC/GC.h"
 #include <set>
 #include "../asmjit/src/asmjit/asmjit.h"
@@ -390,7 +390,7 @@ Type* ResolveType(const char* name);
 //A parse tree node
 
 enum NodeType {
-  NCallNode, NConstantInt, NConstantDouble, NConstantString, NLdLoc, NStLoc, NLdArg, NRet, NBranch, NBinaryExpression
+  NCallNode, NConstantInt, NConstantDouble, NConstantString, NLdLoc, NStLoc, NLdArg, NRet, NBranch, NBinaryExpression, NOPE
 };
 class Node {
 public:
@@ -398,10 +398,15 @@ public:
   std::string resultType;
   Node* next;
   Node* prev;
+  bool fpEmit; //Whether or not the expression's output should be saved to the floating point stack.
+  asmjit::Label label;
+  bool bound;
   Node(NodeType type) {
     this->type = type;
     this->next = 0;
     this->prev = 0;
+    this->fpEmit = false;
+    bound = false;
   }
   virtual ~Node(){};
 };
@@ -573,10 +578,12 @@ public:
     std::vector<Node*> stack;
   Node* instructions;
   Node* lastInstruction;
+  std::map<uint32_t,Node*> ualOffsets;
   template<typename T, typename... arg>
   //Adds an Instruction node to the tree
   T* Node_Instruction(arg... uments) {
     T* retval = new T(uments...);
+    retval->label = JITCompiler->newLabel();
     nodes.push_back(retval);
     if(instructions == 0) {
       instructions = retval;
@@ -586,13 +593,16 @@ public:
       retval->prev = lastInstruction;
       lastInstruction = retval;
     }
+    ualOffsets[this->ualip] = retval;
     return retval;
   }
   template<typename T, typename... arg>
   T* Node_Stackop(arg... uments) {
     T* retval = new T(uments...);
+    retval->label = JITCompiler->newLabel();
     nodes.push_back(retval);
     stack.push_back(retval);
+    ualOffsets[this->ualip] = retval;
     return retval;
   }
   template<typename T>
@@ -634,166 +644,442 @@ public:
     }
     this->assembly = assembly;
     nativefunc = 0;
+    constantStrings = 0;
+    stringCount = 0;
+    stringCapacity = 0;
   }
-  void Compile() {
-    
-    //Compile UAL to x64
-    unsigned char opcode;
-    BStream reader = str;
-    auto GetOffset = [&](){
-      return ((size_t)reader.ptr)-((size_t)str.ptr);
-    };
-    std::map<size_t,asmjit::Label> UALTox64Offsets;
-    std::map<size_t,asmjit::Label> pendingRelocations;
-    
-    
-    
-    auto addInstruction = [&](){
-      size_t ualpos = GetOffset()-1;
-      asmjit::Label instruction;
-      if(pendingRelocations.find(ualpos) != pendingRelocations.end()) {
-	instruction = pendingRelocations[ualpos];
-	JITCompiler->bind(instruction);
-	pendingRelocations.erase(ualpos);
-      }else {
-	instruction = JITCompiler->newLabel();
-	JITCompiler->bind(instruction);
+  
+  
+  GC_String_Header** constantStrings;
+  void* constaddr;
+  size_t stringCount;
+  size_t stringCapacity;
+  uint32_t ualip; //Instruction pointer into UAL
+  void EnsureCapacity() {
+    if(stringCount == stringCapacity) {
+      GC_String_Header** newList = new GC_String_Header*[stringCapacity*2];
+      for(size_t i = 0;i<stringCount;i++) {
+	newList[i] = constantStrings[i];
+	GC_Unmark((void**)(constantStrings+i),true);
+	GC_Mark((void**)(newList+i),true);
       }
-      UALTox64Offsets[ualpos] = instruction;
-      
-    };
+      delete[] constantStrings;
+      constantStrings = newList;
+      stringCapacity*=2;
+    }
+  }
+  std::map<std::string,size_t> constantMappings;
+  
+  size_t GetString(const char* str) {
+    if(constantMappings.find(str) != constantMappings.end()) {
+      return constantMappings[str];
+    }
+    if(constantStrings == 0) {
+      constantStrings = new GC_String_Header*[1];
+      GC_String_Create(constantStrings[0],str);
+      GC_Mark((void**)constantStrings,true);
+      stringCapacity = 1;
+    }else {
+      EnsureCapacity();
+      GC_String_Create(constantStrings[stringCount],str);
+    }
+    constantMappings[str] = stringCount;
+    stringCount++;
+    constaddr = constantStrings;
+    return stringCount-1;
+  }
+  
+  void Optimize() {
+  }
+  asmjit::X86Mem stackmem;
+  size_t* stackOffsetTable;
+  size_t stackSize;
+  //Internal -- Emits x86 code for a MARK instruction given a specified register containing a memory address to mark
+  void EmitMark(asmjit::X86GpVar memreg, bool isRoot) {
     asmjit::FuncBuilderX builder;
-    builder.setRet(asmjit::kVarTypeIntPtr);
     builder.addArg(asmjit::kVarTypeIntPtr);
+    builder.addArg(asmjit::kVarTypeIntPtr);
+    asmjit::X86CallNode* call = JITCompiler->call((size_t)&GC_Mark,asmjit::kFuncConvHost,builder);
+    call->setArg(0,memreg);
+    call->setArg(1,asmjit::imm(isRoot));
+  }
+  void EmitUnmark(asmjit::X86GpVar memreg, bool isRoot) {
+    asmjit::FuncBuilderX builder;
+    builder.addArg(asmjit::kVarTypeIntPtr);
+    builder.addArg(asmjit::kVarTypeIntPtr);
+    asmjit::X86CallNode* call = JITCompiler->call((size_t)&GC_Unmark,asmjit::kFuncConvHost,builder);
+    call->setArg(0,memreg);
+    call->setArg(1,asmjit::imm(isRoot));
+  }
+  //Internal -- Emits x86 code for a given tree node.
+  void EmitNode(Node* inst, asmjit::X86GpVar output) {
+    if(inst->bound) {
+      printf("BUG DETECTED: Tree turned into graph.....\n");
+      abort();
+    }
+    inst->bound = true;
+    JITCompiler->bind(inst->label);
+    
+    switch(inst->type) {
+	case NStLoc:
+	{
+	  StLoc* op = (StLoc*)inst;
+	  if(op->exp->resultType == "System.Double") {
+	    //Optimize for double
+	    op->exp->fpEmit = true;
+	    EmitNode(op->exp,output);
+	    
+	    if(op->exp->fpEmit) {
+	      printf("BUG DETECTED: Subtree did not emit floating point values to stack (or fpEmit flag not cleared).\n");
+	      abort();
+	    }
+	    asmjit::X86GpVar addr = JITCompiler->newGpVar();
+	  JITCompiler->lea(addr,stackmem);
+	  
+	    //Write floating point to memory
+	    JITCompiler->fstp(JITCompiler->intptr_ptr(addr,(int32_t)stackOffsetTable[op->idx]));
+	  }else {
+	  //Store result of expression into local variable
+	  asmjit::X86GpVar temp = JITCompiler->newGpVar();
+	  EmitNode(op->exp,temp);
+	  asmjit::X86GpVar addr = JITCompiler->newGpVar();
+	  JITCompiler->lea(addr,stackmem);
+	  JITCompiler->mov(JITCompiler->intptr_ptr(addr,(int32_t)stackOffsetTable[op->idx]),temp);
+	  if(!ResolveType(op->exp->resultType.data())->isStruct) {
+	    JITCompiler->add(addr,(int32_t)stackOffsetTable[op->idx]);
+	    EmitMark(addr,true);
+	  }
+	  }
+	}
+	  break;
+	  
+	    case NLdLoc:
+	    {
+	      //TODO: Load local variable
+	      LdLoc* op = (LdLoc*)inst;
+	      asmjit::X86GpVar addr = JITCompiler->newGpVar();
+	      JITCompiler->lea(addr,stackmem); //Load the effective base address of the stack
+	      if(op->fpEmit) {
+		//Store value into FPU
+		JITCompiler->fld(JITCompiler->intptr_ptr(addr,(int32_t)stackOffsetTable[op->idx]));
+		//Clear floating point flag
+		op->fpEmit = false;
+	      }else {
+		//Load the value from the base address into the output register
+		JITCompiler->mov(output,JITCompiler->intptr_ptr(addr,(int32_t)stackOffsetTable[op->idx])); 
+	      }
+	    }
+	      break;
+	case NConstantString:
+	{
+	  //Load constant string (we can now do this with only 2 instructions! Thanks to the constant pool.)
+	  asmjit::X86GpVar temp = JITCompiler->newGpVar();
+	  //Load base address of constant pool
+	  JITCompiler->mov(temp,asmjit::imm((size_t)&constaddr));
+	  //Get memory address of constant pool (array)
+	  JITCompiler->mov(temp,JITCompiler->intptr_ptr(temp));
+	  
+	  //Return absolute memory address of string (by dereferencing the index in the array)
+	  JITCompiler->mov(output,JITCompiler->intptr_ptr(temp,sizeof(size_t)*GetString(((ConstantString*)inst)->value)));
+	  
+	}
+	  break;
+	case NCallNode:
+	{
+	  //Function call
+	  CallNode* callme = (CallNode*)inst;
+	  asmjit::FuncBuilderX builder;
+	  for(size_t i = 0;i<callme->arguments.size();i++) {
+	    builder.addArg(asmjit::kVarTypeIntPtr);
+	  }
+	  UALMethod* method = callme->method;
+	  asmjit::X86GpVar* realargs = new asmjit::X86GpVar[method->sig.args.size()]; //varargs
+	  for(size_t i = 0;i<method->sig.args.size();i++) {
+	    realargs[i] = JITCompiler->newGpVar();
+	    EmitNode(callme->arguments[i],realargs[i]);
+	    
+	  }
+	  
+	  asmjit::X86CallNode* call = JITCompiler->call((size_t)abi_ext[method->sig.methodName],asmjit::kFuncConvHost,builder);
+	  
+	  //Bind arguments
+	  for(size_t i = 0;i<callme->arguments.size();i++) {
+	    call->setArg(i,realargs[i]);
+	  }
+	  delete[] realargs;
+	}
+	  break;
+	case NConstantInt:
+	{
+	  ConstantInt* ci = (ConstantInt*)inst;
+	  JITCompiler->mov(output,asmjit::imm(ci->value));
+	}
+	  break;
+	case NConstantDouble:
+	{
+	  ConstantDouble* cv = (ConstantDouble*)inst;
+	  //Load constant double
+	  uint64_t val = *(uint64_t*)&cv->value;
+	  if(cv->fpEmit) {
+	    cv->fpEmit = false;
+	    //NOTE: Assume instruction nodes stay constant in memory throughout program execution.
+	    asmjit::X86GpVar addr = JITCompiler->newGpVar();
+	    JITCompiler->mov(addr,asmjit::imm((size_t)&cv->value));
+	    JITCompiler->fld(JITCompiler->intptr_ptr(addr));
+	    
+	  }else {
+	    JITCompiler->mov(output,asmjit::imm(val));
+	  }
+	}
+	  break;
+	case NBinaryExpression:
+	{
+	  BinaryExpression* binexp = (BinaryExpression*)inst;
+	  switch(binexp->op) {
+	    case '+':
+	    {
+	      if(binexp->left->resultType == "System.Double") { //If we're a double, use the floating point unit instead of the processor.
+		binexp->left->fpEmit = true;
+		binexp->right->fpEmit = true;
+		EmitNode(binexp->right,output); //Evaluate Democratic candidates.
+		EmitNode(binexp->left,output); //Evaluate Republican candidates.
+		
+		if(binexp->left->fpEmit || binexp->right->fpEmit) {
+		  printf("BUG DETECTED: Subtree did not emit floating point values to stack (or fpEmit flag not cleared).\n");
+		  abort();
+		}
+		JITCompiler->faddp();
+		if(binexp->fpEmit) {
+		  binexp->fpEmit = false; //Let caller know that we've handled floating-point value.
+		}else {
+		  //Write value to output register
+		  asmjit::X86GpVar addr = JITCompiler->newGpVar();
+		  JITCompiler->lea(addr,stackmem);
+		  JITCompiler->fstp(JITCompiler->intptr_ptr(addr,stackSize));
+		  JITCompiler->mov(output,JITCompiler->intptr_ptr(addr,stackSize));
+		}
+	      }else {
+		//Use the ALU on the CPU rather than the FPU.
+		asmjit::X86GpVar r = JITCompiler->newGpVar();
+		EmitNode(binexp->left,output);
+		EmitNode(binexp->right,r);
+		JITCompiler->add(output,r);
+	      }
+	    }
+	      break;
+	      case '-':
+	    {
+	      if(binexp->left->resultType == "System.Double") { //If we're a double, use the floating point unit instead of the processor.
+		binexp->left->fpEmit = true;
+		binexp->right->fpEmit = true;
+		EmitNode(binexp->right,output); //Evaluate Democratic candidates.
+		EmitNode(binexp->left,output); //Evaluate Republican candidates.
+		
+		if(binexp->left->fpEmit || binexp->right->fpEmit) {
+		  printf("BUG DETECTED: Subtree did not emit floating point values to stack (or fpEmit flag not cleared).\n");
+		  abort();
+		}
+		JITCompiler->fsubp();
+		if(binexp->fpEmit) {
+		  binexp->fpEmit = false; //Let caller know that we've handled floating-point value.
+		}else {
+		  //Write value to output register
+		  asmjit::X86GpVar addr = JITCompiler->newGpVar();
+		  JITCompiler->lea(addr,stackmem);
+		  JITCompiler->fstp(JITCompiler->intptr_ptr(addr,stackSize));
+		  JITCompiler->mov(output,JITCompiler->intptr_ptr(addr,stackSize));
+		}
+	      }else {
+		//Use the ALU on the CPU rather than the FPU.
+		asmjit::X86GpVar r = JITCompiler->newGpVar();
+		EmitNode(binexp->left,output);
+		EmitNode(binexp->right,r);
+		JITCompiler->sub(output,r);
+	      }
+	    }
+	      break;
+	      case '*':
+	    {
+	      if(binexp->left->resultType == "System.Double") { //If we're a double, use the floating point unit instead of the processor.
+		binexp->left->fpEmit = true;
+		binexp->right->fpEmit = true;
+		EmitNode(binexp->right,output); //Evaluate Democratic candidates.
+		EmitNode(binexp->left,output); //Evaluate Republican candidates.
+		
+		if(binexp->left->fpEmit || binexp->right->fpEmit) {
+		  printf("BUG DETECTED: Subtree did not emit floating point values to stack (or fpEmit flag not cleared).\n");
+		  abort();
+		}
+		JITCompiler->fmulp();
+		if(binexp->fpEmit) {
+		  binexp->fpEmit = false; //Let caller know that we've handled floating-point value.
+		}else {
+		  //Write value to output register
+		  asmjit::X86GpVar addr = JITCompiler->newGpVar();
+		  JITCompiler->lea(addr,stackmem);
+		  JITCompiler->fstp(JITCompiler->intptr_ptr(addr,stackSize));
+		  JITCompiler->mov(output,JITCompiler->intptr_ptr(addr,stackSize));
+		}
+	      }else {
+		//Use the ALU on the CPU rather than the FPU.
+		asmjit::X86GpVar r = JITCompiler->newGpVar();
+		EmitNode(binexp->left,output);
+		EmitNode(binexp->right,r);
+		JITCompiler->imul(output,r);
+	      }
+	    }
+	      break;
+	      case '/':
+	    {
+	      if(binexp->left->resultType == "System.Double") { //If we're a double, use the floating point unit instead of the processor.
+		binexp->left->fpEmit = true;
+		binexp->right->fpEmit = true;
+		EmitNode(binexp->right,output); //Evaluate Democratic candidates.
+		EmitNode(binexp->left,output); //Evaluate Republican candidates.
+		
+		if(binexp->left->fpEmit || binexp->right->fpEmit) {
+		  printf("BUG DETECTED: Subtree did not emit floating point values to stack (or fpEmit flag not cleared).\n");
+		  abort();
+		}
+		JITCompiler->fdivp();
+		if(binexp->fpEmit) {
+		  binexp->fpEmit = false; //Let caller know that we've handled floating-point value.
+		}else {
+		  //Write value to output register
+		  asmjit::X86GpVar addr = JITCompiler->newGpVar();
+		  JITCompiler->lea(addr,stackmem);
+		  JITCompiler->fstp(JITCompiler->intptr_ptr(addr,stackSize));
+		  JITCompiler->mov(output,JITCompiler->intptr_ptr(addr,stackSize));
+		}
+	      }else {
+		//Use the ALU on the CPU rather than the FPU.
+		asmjit::X86GpVar r = JITCompiler->newGpVar();
+		EmitNode(binexp->left,output);
+		EmitNode(binexp->right,r);
+		asmjit::X86GpVar reminder = JITCompiler->newGpVar();
+		JITCompiler->xor_(reminder,reminder);
+		JITCompiler->idiv(reminder,output,r);
+	      }
+	    }
+	      break;
+	      case '%':
+	    {
+	     //Use the ALU on the CPU rather than the FPU.
+		asmjit::X86GpVar r = JITCompiler->newGpVar();
+		EmitNode(binexp->left,output);
+		EmitNode(binexp->right,r);
+		asmjit::X86GpVar reminder = JITCompiler->newGpVar();
+		JITCompiler->xor_(reminder,reminder);
+		JITCompiler->idiv(reminder,output,r);
+		JITCompiler->mov(output,reminder);
+	    }
+	      break;
+	    default:
+	      printf("Operator %c not implemented yet....\n",binexp->op);
+	      abort();
+	  }
+	}
+	  break;
+	    case NBranch:
+	    {
+	      Branch* b = (Branch*)inst;
+	      if(ualOffsets.find(b->offset) == ualOffsets.end()) {
+		throw "Illegal UAL offset";
+	      }
+	      Node* bnode = this->ualOffsets[b->offset]; //Node to branch to
+	      switch(b->condition) {
+		case UnconditionalSurrender:
+		{
+		  
+		  JITCompiler->jmp(bnode->label);
+		}
+		  break;
+		case Ble:
+		{
+		  //Check conditions
+		  asmjit::X86GpVar left = JITCompiler->newGpVar();
+		  asmjit::X86GpVar right = JITCompiler->newGpVar();
+		  
+		 //ldconst.12 -- Load constant 12, this seems to be ommitted for some reason.
+		  EmitNode(b->right,right);
+		  EmitNode(b->left,left);
+		  JITCompiler->cmp(right,left);
+		  JITCompiler->jle(bnode->label);
+		}
+		  break;
+		default:
+		printf("TODO: Implement branch\n");
+		abort();
+	      }
+	      
+	    }
+	      break;
+		case NOPE:
+		  //Not gonna do that
+		  break;
+	default:
+	  printf("Unknown tree instruction.\n");
+	  abort();
+      }
+  }
+  void Emit() {
+    asmjit::FuncBuilderX builder;
+    for(size_t i = 0;i<this->sig.args.size();i++) {
+      builder.addArg(asmjit::kVarTypeIntPtr);
+    }
+    
     JITCompiler->addFunc(asmjit::kFuncConvHost,builder);
     
+    //BEGIN set up stack
     
+    stackOffsetTable = new size_t[localVarCount];
+    stackSize = 0;
+    {
+      size_t cOffset = 0;
+      for(size_t i = 0;i<localVarCount;i++) {
+	Type* tdef = ResolveType(this->locals[i].data());
+	size_t requiredSize = 0;
+	if(tdef->isStruct) {
+	  requiredSize = tdef->size;
+	}else {
+	  requiredSize = sizeof(size_t);
+	}
+	requiredSize+=(requiredSize % 8); //Align stack to largest size possible primitive datatype.
+	
+	stackSize+=requiredSize;
+	stackOffsetTable[i] = cOffset;
+	cOffset+=requiredSize;
+      }
+    }
+    stackmem = JITCompiler->newStack(stackSize+(sizeof(double)*2),8);
+    //END set up stack
+    //BEGIN code emit
     
-    //Stack size = localVarCount+1 temporary store
-    size_t stackmem_tempoffset = (localVarCount)*sizeof(size_t);
-    asmjit::X86Mem stackmem = JITCompiler->newStack((localVarCount+2)*sizeof(size_t),sizeof(size_t));
-    
-    
-    
-    
-    //asmjit::X86GpVar arglist = JITCompiler->newGpVar(); //NOTE: Old calling convention (used GC_Array_Header of arguments)
-    //JITCompiler->setArg(0,arglist);
-    StackEntry frame[10];
-    StackEntry* position = frame;
-    
-    
-    
-    //Calling convention:
-    //Each argument is word size of processor
-    //For Object types, pass memory address in register (if available)
-    //TODO: Struct handling
-    
-    /**
-     * @summary Pops a variable from the stack, and puts it in the specified register or memory location
-     * */
-    auto pop = [&](asmjit::X86GpVar& location) {
-      position--;
-       switch(position->entryType) {
-	 case 0:
-	 {
-	   //Load value from argument
-	   uint32_t argidx = (uint32_t)(size_t)position->value;
-	   JITCompiler->setArg(argidx,location);
-	 }
-	   break;
-	 case 1:
-	 {
-	   //TODO: IMPORTANT NOTE:
-	   //We've found the cause of the problem -- NewStack can only be called once per function.
-	   //We need to know the stack size ahead of time.
-	   
-	   
-	   //Load string immediate
-	   //Need to call GC_String_Create with address of C string
-	   asmjit::X86GpVar stackptr = JITCompiler->newGpVar();
-	   asmjit::X86GpVar stringptr = JITCompiler->newGpVar();
-	   JITCompiler->lea(stackptr,stackmem); //Load effective address of stack memory (contains pointer to GC_String_Header)
-	   JITCompiler->add(stackptr,asmjit::imm(stackmem_tempoffset));
-	   
-	   JITCompiler->mov(stringptr,asmjit::imm((size_t)position->value));
-	   printf("Load string:%s:\n",position->value);
-	   asmjit::FuncBuilderX builder;
-	   builder.addArg(asmjit::kVarTypeIntPtr);
-	   builder.addArg(asmjit::kVarTypeIntPtr);
-	   
-	   //Create managed string from C-string
-	   asmjit::X86CallNode* funccall = JITCompiler->call((size_t)&GC_String_Create,asmjit::kFuncConvHost,builder);
-	   funccall->setArg(0,stackptr);
-	   funccall->setArg(1,stringptr);
-	   //MOVE managed object
-	   JITCompiler->mov(location,JITCompiler->intptr_ptr(stackptr)); //MOVImm ManagedObject
-	 }
-	   break;
-	 case 2:
-	 {
-	   //Load 32-bit word immediate
-	   JITCompiler->mov(location,asmjit::imm((int)(ssize_t)position->value));
-	 }
-	   break;
-	 case 3:
-	 {
-	   //Pop from local variable
-	   size_t varidx = (size_t)position->value;
-	   asmjit::X86GpVar temp = JITCompiler->newGpVar();
-	   JITCompiler->lea(temp,stackmem);
-	   JITCompiler->add(temp,varidx*sizeof(size_t));
-	   JITCompiler->mov(location,JITCompiler->intptr_ptr(temp));
-	 }
-	   break;
-	 case 4:
-	 {
-	   DeferredOperation* dop = (DeferredOperation*)position->value;
-	   dop->Run(location);
-	   delete dop;
-	 }
-	   break;
-	 case 5:
-	 {
-	   //We're loading the right values here....
-	   //Load FP immediate
-	   JITCompiler->mov(location,asmjit::imm((uint64_t)position->value));
-	 }
-	   break;
-       }
-       
-    };
-    //Execute a write barrier mark at the location specified in this register.
-    auto mark = [&](asmjit::X86GpVar& location, bool isRoot) {
-      asmjit::FuncBuilderX builder;
-      builder.addArg(asmjit::kVarTypeIntPtr);
-      builder.addArg(asmjit::kVarTypeInt8);
-      asmjit::X86CallNode* funccall = JITCompiler->call((size_t)&GC_Mark,asmjit::kFuncConvHost,builder);
-      funccall->setArg(0,location);
-      funccall->setArg(1,asmjit::imm(isRoot));
+    asmjit::X86GpVar output = JITCompiler->newGpVar();
+    for(Node* inst = instructions;inst != 0;inst = inst->next) {
       
-    };
-    auto unmark = [&](asmjit::X86GpVar& location, bool isRoot) {
-      asmjit::FuncBuilderX builder;
-      builder.addArg(asmjit::kVarTypeIntPtr);
-      builder.addArg(asmjit::kVarTypeInt8);
-      asmjit::X86CallNode* funccall = JITCompiler->call((size_t)&GC_Unmark,asmjit::kFuncConvHost,builder);
-      
-      funccall->setArg(0,location);
-      funccall->setArg(1,asmjit::imm(isRoot));
-      
-      
-    };
-    auto MakeLabel = [&]() {
-      asmjit::Label retval = JITCompiler->newLabel();
-      JITCompiler->bind(retval);
-      return retval;
-    };
+      EmitNode(inst,output);
+    }
+    //END Code emit
+    JITCompiler->endFunc();
+    nativefunc = JITCompiler->make();
+  }
+  void Compile() {
+    Parse();
+    Optimize();
+    Emit();
+  }
+  
+  
+  void Parse() {
     
-    auto GetPosition = [&]() {
-      return position;
-    };
-    
+    //Generate parse tree
+    unsigned char opcode;
+    unsigned char* base = str.ptr;
+    BStream reader = str;
     while(reader.Read(opcode) != 255) {
+      ualip = (uint32_t)((size_t)reader.ptr-(size_t)base)-1;
+      
       printf("OPCODE: %i\n",(int)opcode);
       switch(opcode) {
 	case 0:
@@ -801,11 +1087,7 @@ public:
 	  //Push argument to evaluation stack
 	  uint32_t index;
 	  reader.Read(index);
-	  position->entryType = 0;
-	  position->value = (void*)index;
 	  std::string tname = sig.args[index];
-	  position->type = ResolveType(tname.data());
-	  position++;
 	  Node* sobj = Node_Stackop<LdArg>(index,tname.data());
 	  
 	  
@@ -814,47 +1096,10 @@ public:
 	case 1:
 	  //Call function
 	{
-	  addInstruction();
-	  
 	  uint32_t funcID;
 	  reader.Read(funcID);
 	  UALMethod* method = ResolveMethod(assembly,funcID);
 	  size_t argcount = method->sig.args.size();
-	  asmjit::FuncBuilderX methodsig;
-	  asmjit::X86CallNode* call;
-	  
-	  
-	  //Stack memory for managed objects. For now; we'll assume that they're all managed.
-	  asmjit::X86GpVar* realargs = new asmjit::X86GpVar[argcount];
-	  
-	    asmjit::X86GpVar temp = JITCompiler->newGpVar();
-	  for(size_t i = 0;i<argcount;i++) {
-	    realargs[i] = JITCompiler->newGpVar();  
-	    pop(realargs[i]);
-	  }
-	  
-	  
-	  for(size_t i = 0;i<argcount;i++) {
-	    
-	      methodsig.addArg(asmjit::kVarTypeIntPtr);
-	    
-	  }
-	  if(method->nativefunc) {
-	    
-	    printf("EXPERIMENTAL: Invoke managed function\n");
-	    call = JITCompiler->call((size_t)method->nativefunc,asmjit::kFuncConvHost,methodsig);
-	  }else {
-	    //call = JITCompiler->call()
-	    void* funcptr = (void*)abi_ext[method->sig.methodName.data()];
-	    call = JITCompiler->call((size_t)funcptr,asmjit::kFuncConvHost,methodsig);
-	  }
-	  for(size_t i = 0;i<argcount;i++) {
-	      call->setArg(i,realargs[i]);
-	  }
-	  
-	  
-	  
-	  delete[] realargs;
 	  std::vector<Node*> args;
 	  args.resize(argcount);
 	  for(size_t i = 0;i<argcount;i++) {
@@ -876,23 +1121,12 @@ public:
 	case 2:
 	  //Load string
 	{
-	  addInstruction();
-	  
-	  position->value = reader.ReadString();
-	  position->entryType = 1; //Load string
-	  position->type = ResolveType("System.String");
-	  position++;
-	  
-	  Node* sobj = Node_Stackop<ConstantString>((const char*)position->value);
+	  Node* sobj = Node_Stackop<ConstantString>(reader.ReadString());
 	  
 	}
 	  break;
 	case 3:
 	{
-	  //RET
-	  JITCompiler->ret();
-	  
-	  
 	  if(this->sig.returnType == "System.Void") {
 	    //There should be nothing on stack
 	    if(stack.size()) {
@@ -913,13 +1147,8 @@ public:
 	case 4:
 	{
 	  //Load 32-bit integer immediate
-	  addInstruction();
 	  uint32_t val;
 	  reader.Read(val);
-	  position->entryType = 2; //Load 32-bit word
-	  position->type = ResolveType("System.Int32");
-	  position->value = (void*)(uint64_t)val;
-	  position++;
 	  Node_Stackop<ConstantInt>(val);
 	}
 	  break;
@@ -927,20 +1156,7 @@ public:
 	  //stloc
 	{
 	  uint32_t index;
-	  addInstruction();
 	  reader.Read(index);
-	  
-	  asmjit::X86GpVar temp = JITCompiler->newGpVar();
-	  JITCompiler->lea(temp,stackmem);
-	  JITCompiler->add(temp,asmjit::imm((size_t)(sizeof(size_t)*index)));
-	  //TODO: Write barrier if managed object
-	  asmjit::X86GpVar valreg = JITCompiler->newGpVar();
-	  pop(valreg);
-	  JITCompiler->mov(JITCompiler->intptr_ptr(temp),valreg);
-	  std::string tname = this->locals[index];
-	  if(!ResolveType(tname.data())->isStruct) {
-	    mark(temp,true);
-	  }
 	  
 	  //Store value to local
 	  if(stack.size() == 0) {
@@ -961,19 +1177,8 @@ public:
 	case 6:
 	  //Branch to str.ptr+offset
 	{
-	  addInstruction();
 	  uint32_t offset;
 	  reader.Read(offset);
-	  //TODO: Crashes on ondiscovered offset. Patch this later (defer) somehow.
-	  
-	   if(UALTox64Offsets.find(offset) == UALTox64Offsets.end()) {
-	     asmjit::Label jmpOffset = JITCompiler->newLabel();
-	    pendingRelocations[offset] = jmpOffset;
-	    JITCompiler->jmp(jmpOffset);
-	  }else {
-	    JITCompiler->jmp(UALTox64Offsets[offset]); //Make Link jump! (NO!!!!! It's Zelda!)
-	   }
-	   
 	   Node_Instruction<Branch>(offset, UnconditionalSurrender, (Node*)0, (Node*)0);
 	   
 	}
@@ -981,67 +1186,14 @@ public:
 	case 7:
 	{
 	  //LDLOC
-	  addInstruction();
 	  uint32_t id;
 	  reader.Read(id);
-	  //TODO: Push local variable onto stack
-	  position->entryType = 3;
-	  position->value = (void*)(size_t)id;
 	  std::string tname = this->locals[id];
-	  position->type = ResolveType(tname.data());
-	  position++;
-	  
 	  Node_Stackop<LdLoc>(id,tname.data());
 	}
 	  break;
 	case 8:
 	{
-	  //Add values TODO type check
-	  //NOTE: We can only perform addition on native data types; not managed ones.
-	  
-	  
-	  //TODO: Maybe we can defer execution of this whole segment until it is needed somehow?
-	  addInstruction();
-	  
-	  DeferredOperation* op = MakeDeferred([=](asmjit::X86GpVar output){
-	    
-	    asmjit::X86GpVar b = JITCompiler->newGpVar();
-	    pop(b);
-	    pop(output);
-	    if(GetPosition()->type == ResolveType("System.Double")) {
-	      
-	      //NOTE: The FPU is sort of like a separate processor.
-	      //The FPU has its own set of registers, and can only transfer data through the main memory bus of the chip.
-	      //Therefore it is not possible to transfer values directly from the FPU to CPU registers; or vice-versa.
-	      //So; unfortunately, we will have to transfer from our source registers, to memory, then to the FPU.
-	      //The current optimizing engine won't be able to optimize this out, so floating point operations will be incredibly slow.
-	      //This will be fixed when (and if) I add a new optimizer.
-	      
-	      //Temp 0, 1 = address of temporaries on stack
-	      asmjit::X86GpVar temp = JITCompiler->newGpVar();
-	      JITCompiler->lea(temp,stackmem);
-	      JITCompiler->add(temp,stackmem_tempoffset); //Compute the address of the stack start
-	      JITCompiler->mov(JITCompiler->intptr_ptr(temp),output);
-	      JITCompiler->mov(JITCompiler->intptr_ptr(temp,8),b);
-	      JITCompiler->fld(JITCompiler->intptr_ptr(temp));
-	      JITCompiler->fld(JITCompiler->intptr_ptr(temp,8));
-	      JITCompiler->faddp(); //Eat your Raspberry Pi.
-	      JITCompiler->fst(JITCompiler->intptr_ptr(temp));
-	      JITCompiler->mov(output,JITCompiler->intptr_ptr(temp));
-	      
-	    }else {
-	      JITCompiler->add(output,b);
-	    }
-	    
-	  });
-	  
-	  //TODO: Push result to stack
-	  //TODO: This is a bad idea. It messes up RSP and causes stuff to be written to the wrong place.
-	  position->entryType = 4;
-	  position->value = op;
-	  position++;
-	  
-	  
 	  if(stack.size() < 2) {
 	    throw "Malformed UAL. Expected two operands on stack.";
 	  }
@@ -1062,24 +1214,9 @@ public:
 	  break;
 	case 9:
 	{
-	  //BLE!!!!!! (emit barfing sound here into the assembly code)
-	  addInstruction();
-	  asmjit::X86GpVar v0 = JITCompiler->newGpVar();
-	  asmjit::X86GpVar v1 = JITCompiler->newGpVar();
-	  pop(v0);
-	  pop(v1);
-	  JITCompiler->cmp(v1,v0);
+	  //BLE!!!!!! (NOTE: emit barfing sound here into the assembly code)
 	  uint32_t offset;
 	  reader.Read(offset);
-	  if(UALTox64Offsets.find(offset) != UALTox64Offsets.end()) {
-	    JITCompiler->jle(UALTox64Offsets[offset]);
-	  }else {
-	    asmjit::Label label = JITCompiler->newLabel();
-	    pendingRelocations[offset] = label;
-	    JITCompiler->jle(label);
-	    
-	  }
-	  
 	  if(stack.size()<2) {
 	    throw "Malformed UAL. Comparison expressions must use BOTH a Democrat and a Republican.";
 	  }
@@ -1098,33 +1235,14 @@ public:
 	case 10:
 	  //NOPE. Not gonna happen.
 	{
-	  addInstruction();
+	  Node_Instruction<Node>(NOPE);
 	}
 	  break;
 	case 11:
 	  {
 	  //BEQ
-	  addInstruction();
-	  asmjit::X86GpVar v0 = JITCompiler->newGpVar();
-	  asmjit::X86GpVar v1 = JITCompiler->newGpVar();
-	  pop(v0);
-	  pop(v1);
-	  JITCompiler->cmp(v0,v1);
 	  uint32_t offset;
 	  reader.Read(offset);
-	  if(UALTox64Offsets.find(offset) != UALTox64Offsets.end()) {
-	    JITCompiler->je(UALTox64Offsets[offset]);
-	  }else {
-	    asmjit::Label label = JITCompiler->newLabel();
-	    pendingRelocations[offset] = label;
-	    JITCompiler->je(label);
-	    
-	  }
-	  
-	  
-	  
-	  
-	  
 	  if(stack.size()<2) {
 	    throw "Malformed UAL. Comparison expressions must use BOTH a Democrat and a Republican.";
 	  }
@@ -1142,25 +1260,8 @@ public:
 	case 12:
 	{
 	  //BNE
-	  addInstruction();
-	  asmjit::X86GpVar v0 = JITCompiler->newGpVar();
-	  asmjit::X86GpVar v1 = JITCompiler->newGpVar();
-	  pop(v0);
-	  pop(v1);
-	  JITCompiler->cmp(v1,v0);
 	  uint32_t offset;
 	  reader.Read(offset);
-	  if(UALTox64Offsets.find(offset) != UALTox64Offsets.end()) {
-	    JITCompiler->jne(UALTox64Offsets[offset]);
-	  }else {
-	    asmjit::Label label = JITCompiler->newLabel();
-	    pendingRelocations[offset] = label;
-	    JITCompiler->jne(label);
-	    
-	  }
-	  
-	  
-	  
 	  if(stack.size()<2) {
 	    throw "Malformed UAL. Comparison expressions must use BOTH a Democrat and a Republican.";
 	  }
@@ -1178,25 +1279,8 @@ public:
 	  case 13:
 	{
 	  //BGT
-	  addInstruction();
-	  asmjit::X86GpVar v0 = JITCompiler->newGpVar();
-	  asmjit::X86GpVar v1 = JITCompiler->newGpVar();
-	  pop(v0);
-	  pop(v1);
-	  JITCompiler->cmp(v1,v0);
 	  uint32_t offset;
 	  reader.Read(offset);
-	  if(UALTox64Offsets.find(offset) != UALTox64Offsets.end()) {
-	    JITCompiler->jg(UALTox64Offsets[offset]);
-	  }else {
-	    asmjit::Label label = JITCompiler->newLabel();
-	    pendingRelocations[offset] = label;
-	    JITCompiler->jg(label);
-	    
-	  }
-	  
-	  
-	  
 	  if(stack.size()<2) {
 	    throw "Malformed UAL. Comparison expressions must use BOTH a Democrat and a Republican.";
 	  }
@@ -1216,25 +1300,8 @@ public:
 	  case 14:
 	{
 	  //>=
-	  addInstruction();
-	  asmjit::X86GpVar v0 = JITCompiler->newGpVar();
-	  asmjit::X86GpVar v1 = JITCompiler->newGpVar();
-	  pop(v0);
-	  pop(v1);
-	  JITCompiler->cmp(v1,v0);
 	  uint32_t offset;
 	  reader.Read(offset);
-	  if(UALTox64Offsets.find(offset) != UALTox64Offsets.end()) {
-	    JITCompiler->jge(UALTox64Offsets[offset]);
-	  }else {
-	    asmjit::Label label = JITCompiler->newLabel();
-	    pendingRelocations[offset] = label;
-	    JITCompiler->jge(label);
-	    
-	  }
-	  
-	  
-	  
 	  if(stack.size()<2) {
 	    throw "Malformed UAL. Comparison expressions must use BOTH a Democrat and a Republican.";
 	  }
@@ -1251,56 +1318,6 @@ public:
 	  break;
 	  case 15:
 	{
-	  //TODO type check
-	  //NOTE: We can only perform addition on native data types; not managed ones.
-	  
-	  
-	  addInstruction();
-	  
-	  DeferredOperation* op = MakeDeferred([=](asmjit::X86GpVar output){
-	   
-	    asmjit::X86GpVar b = JITCompiler->newGpVar();
-	    pop(b); 
-	    pop(output);
-	     if(GetPosition()->type == ResolveType("System.Double")) {
-	      
-	      //NOTE: The FPU is sort of like a separate processor.
-	      //The FPU has its own set of registers, and can only transfer data through the main memory bus of the chip.
-	      //Therefore it is not possible to transfer values directly from the FPU to CPU registers; or vice-versa.
-	      //So; unfortunately, we will have to transfer from our source registers, to memory, then to the FPU.
-	      //The current optimizing engine won't be able to optimize this out, so floating point operations will be incredibly slow.
-	      //This will be fixed when (and if) I add a new optimizer.
-	      
-	      //Temp 0, 1 = address of temporaries on stack
-	      asmjit::X86GpVar temp = JITCompiler->newGpVar();
-	      JITCompiler->lea(temp,stackmem);
-	      JITCompiler->add(temp,stackmem_tempoffset); //Compute the address of the stack start
-	      JITCompiler->mov(JITCompiler->intptr_ptr(temp),output);
-	      JITCompiler->mov(JITCompiler->intptr_ptr(temp,8),b);
-	      JITCompiler->fld(JITCompiler->intptr_ptr(temp));
-	      JITCompiler->fld(JITCompiler->intptr_ptr(temp,8));
-	      JITCompiler->fsubp(); //Eat your Raspberry Pi.
-	      JITCompiler->fst(JITCompiler->intptr_ptr(temp));
-	      JITCompiler->mov(output,JITCompiler->intptr_ptr(temp));
-	      
-	      
-	     // printf("TODO: Floating point support\n");
-	     // abort();
-	    }else {
-	      JITCompiler->sub(output,b);
-	    }
-	   
-	   
-	   
-	   
-	    
-	  });
-	  
-	  position->entryType = 4;
-	  position->value = op;
-	  
-	  position++;
-	  
 	  
 	  
 	  if(stack.size() < 2) {
@@ -1324,55 +1341,6 @@ public:
 	  break;
 	  case 16:
 	{
-	  //TODO type check
-	  //NOTE: We can only perform addition on native data types; not managed ones.
-	  
-	  
-	  addInstruction();
-	  
-	  DeferredOperation* op = MakeDeferred([=](asmjit::X86GpVar output){
-	    
-	    asmjit::X86GpVar b = JITCompiler->newGpVar();
-	    pop(b); 
-	    pop(output);
-	     if(GetPosition()->type == ResolveType("System.Double")) {
-	      
-	      //NOTE: The FPU is sort of like a separate processor.
-	      //The FPU has its own set of registers, and can only transfer data through the main memory bus of the chip.
-	      //Therefore it is not possible to transfer values directly from the FPU to CPU registers; or vice-versa.
-	      //So; unfortunately, we will have to transfer from our source registers, to memory, then to the FPU.
-	      //The current optimizing engine won't be able to optimize this out, so floating point operations will be incredibly slow.
-	      //This will be fixed when (and if) I add a new optimizer.
-	      
-	      //Temp 0, 1 = address of temporaries on stack
-	      asmjit::X86GpVar temp = JITCompiler->newGpVar();
-	      JITCompiler->lea(temp,stackmem);
-	      JITCompiler->add(temp,stackmem_tempoffset); //Compute the address of the stack start
-	      JITCompiler->mov(JITCompiler->intptr_ptr(temp),output);
-	      JITCompiler->mov(JITCompiler->intptr_ptr(temp,8),b);
-	      JITCompiler->fld(JITCompiler->intptr_ptr(temp));
-	      JITCompiler->fld(JITCompiler->intptr_ptr(temp,8));
-	      JITCompiler->fmulp(); //Eat your Raspberry Pi.
-	      JITCompiler->fst(JITCompiler->intptr_ptr(temp));
-	      JITCompiler->mov(output,JITCompiler->intptr_ptr(temp));
-	      
-	      
-	     // printf("TODO: Floating point support\n");
-	     // abort();
-	    }else {
-	      JITCompiler->imul(output,b);
-	    }
-	   
-	    
-	  });
-	  
-	  position->entryType = 4;
-	  position->value = op;
-	  
-	  position++;
-	  
-	  
-	  
 	  if(stack.size() < 2) {
 	    throw "Malformed UAL. Expected two operands on stack.";
 	  }
@@ -1392,44 +1360,6 @@ public:
 	  break;
 	  case 17:
 	{
-	  //TODO type check
-	  //NOTE: We can only perform addition on native data types; not managed ones.
-	  
-	  
-	  addInstruction();
-	  
-	  DeferredOperation* op = MakeDeferred([=](asmjit::X86GpVar output){
-	    
-	    asmjit::X86GpVar b = JITCompiler->newGpVar();
-	    asmjit::X86GpVar remainder = JITCompiler->newGpVar();
-	    JITCompiler->xor_(remainder,remainder); //Rename to zero register (as per https://randomascii.wordpress.com/2012/12/29/the-surprising-subtleties-of-zeroing-a-register/)
-	    pop(b); 
-	    pop(output);
-	    if(GetPosition()->type == ResolveType("System.Double")) {
-	       asmjit::X86GpVar temp = JITCompiler->newGpVar();
-	      JITCompiler->lea(temp,stackmem);
-	      JITCompiler->add(temp,stackmem_tempoffset); //Compute the address of the stack start
-	      JITCompiler->mov(JITCompiler->intptr_ptr(temp),output);
-	      JITCompiler->mov(JITCompiler->intptr_ptr(temp,8),b);
-	      JITCompiler->fld(JITCompiler->intptr_ptr(temp));
-	      JITCompiler->fld(JITCompiler->intptr_ptr(temp,8));
-	      JITCompiler->fdivp(); //NOTE: Remember the famous FDIV bug in the Pentium chip?
-	      
-	      JITCompiler->fst(JITCompiler->intptr_ptr(temp));
-	      JITCompiler->mov(output,JITCompiler->intptr_ptr(temp));
-	      
-	      //abort();
-	    }else {
-	      JITCompiler->idiv(remainder,output,b); //Yes. The x86_64 div instruction actually works on 128-bit integers......
-	    }
-	  });
-	  position->entryType = 4;
-	  position->value = op;
-	  
-	  position++;
-	  
-	  
-	  
 	  if(stack.size() < 2) {
 	    throw "Malformed UAL. Expected two operands on stack.";
 	  }
@@ -1450,31 +1380,6 @@ public:
 	  break;
 	  case 18:
 	{
-	  //TODO type check
-	  //NOTE: We can only perform addition on native data types; not managed ones.
-	  
-	  
-	  addInstruction();
-	  
-	  DeferredOperation* op = MakeDeferred([=](asmjit::X86GpVar output){
-	    
-	    asmjit::X86GpVar b = JITCompiler->newGpVar();
-	    asmjit::X86GpVar remainder = JITCompiler->newGpVar();
-	    JITCompiler->xor_(remainder,remainder); //Rename to zero register (as per https://randomascii.wordpress.com/2012/12/29/the-surprising-subtleties-of-zeroing-a-register/)
-	    pop(b); 
-	    pop(output);
-	    JITCompiler->idiv(remainder,output,b);
-	    JITCompiler->mov(output,remainder);
-	    
-	  });
-	  
-	  position->entryType = 4;
-	  position->value = op;
-	  
-	  position++;
-	  
-	  
-	  
 	  if(stack.size() < 2) {
 	    throw "Malformed UAL. Expected two operands on stack.";
 	  }
@@ -1496,23 +1401,6 @@ public:
 	  
 	    case 19:
 	{
-	  
-	  addInstruction();
-	  
-	  DeferredOperation* op = MakeDeferred([=](asmjit::X86GpVar output){
-	    
-	    asmjit::X86GpVar b = JITCompiler->newGpVar();
-	    pop(b); 
-	    pop(output);
-	    JITCompiler->shl(output,b);
-	    
-	  });
-	  
-	  position->entryType = 4;
-	  position->value = op;
-	  
-	  position++;
-	  
 	  
 	  if(stack.size() < 2) {
 	    throw "Malformed UAL. Expected two operands on stack.";
@@ -1538,24 +1426,6 @@ public:
 	    case 20:
 	{
 	  
-	  addInstruction();
-	  
-	  DeferredOperation* op = MakeDeferred([=](asmjit::X86GpVar output){
-	    
-	    asmjit::X86GpVar b = JITCompiler->newGpVar();
-	    pop(b); 
-	    pop(output);
-	    JITCompiler->shr(output,b);
-	    
-	  });
-	  
-	  position->entryType = 4;
-	  position->value = op;
-	  
-	  position++;
-	  
-	  
-	  
 	  if(stack.size() < 2) {
 	    throw "Malformed UAL. Expected two operands on stack.";
 	  }
@@ -1578,24 +1448,6 @@ public:
 	    case 21:
 	{
 	  
-	  addInstruction();
-	  
-	  DeferredOperation* op = MakeDeferred([=](asmjit::X86GpVar output){
-	    
-	    asmjit::X86GpVar b = JITCompiler->newGpVar();
-	    pop(b); 
-	    pop(output);
-	    JITCompiler->and_(output,b);
-	    
-	  });
-	  
-	  position->entryType = 4;
-	  position->value = op;
-	  
-	  position++;
-	  
-	  
-	  
 	  if(stack.size() < 2) {
 	    throw "Malformed UAL. Expected two operands on stack.";
 	  }
@@ -1616,24 +1468,6 @@ public:
 	
 	    case 22:
 	{
-	  
-	  addInstruction();
-	  
-	  DeferredOperation* op = MakeDeferred([=](asmjit::X86GpVar output){
-	    
-	    asmjit::X86GpVar b = JITCompiler->newGpVar();
-	    pop(b); 
-	    pop(output);
-	    JITCompiler->or_(output,b);
-	    
-	  });
-	  
-	  position->entryType = 4;
-	  position->value = op;
-	  
-	  position++;
-	  
-	  
 	  
 	  if(stack.size() < 2) {
 	    throw "Malformed UAL. Expected two operands on stack.";
@@ -1656,24 +1490,6 @@ public:
 	    case 23:
 	{
 	  
-	  addInstruction();
-	  
-	  DeferredOperation* op = MakeDeferred([=](asmjit::X86GpVar output){
-	    
-	    asmjit::X86GpVar b = JITCompiler->newGpVar();
-	    pop(b); 
-	    pop(output);
-	    JITCompiler->xor_(output,b);
-	    
-	  });
-	  
-	  position->entryType = 4;
-	  position->value = op;
-	  
-	  position++;
-	  
-	  
-	  
 	  if(stack.size() < 2) {
 	    throw "Malformed UAL. Expected two operands on stack.";
 	  }
@@ -1695,22 +1511,6 @@ public:
 	    case 24:
 	{
 	  
-	  addInstruction();
-	  
-	  DeferredOperation* op = MakeDeferred([=](asmjit::X86GpVar output){
-	    
-	    pop(output);
-	    JITCompiler->not_(output);
-	    
-	  });
-	  
-	  position->entryType = 4;
-	  position->value = op;
-	  
-	  position++;
-	  
-	  
-	  
 	  if(stack.size() < 1) {
 	    throw "Malformed UAL. Expected at least one operand on the stack.";
 	  }
@@ -1720,21 +1520,14 @@ public:
 	  }
 	  Node_Stackop<BinaryExpression>('!',Node_RemoveInstruction(left),(Node*)0);
 	  
+	  
 	}
 	break;  
 	    case 25:
 	    {
 	      //Load FP immediate
-	      addInstruction();
-	      position->entryType = 5;
-	      position->type = ResolveType("System.Double");
 	      double word; //We read in a doubleword
 	      reader.Read(word);
-	      position->value = (void*)(*(uint64_t*)&word);
-	      position++;
-	      
-	      
-	      
 	      Node_Stackop<ConstantDouble>(word);
 	      
 	    }
@@ -1745,24 +1538,12 @@ public:
 	  goto velociraptor;
       }
     }
-    velociraptor:
     
-    if(pendingRelocations.size()) {
-      printf("ERROR: Unable to compile. One or more relocated code sections could not be resolved.\n");
-      
-      throw "up";
-    }
+    velociraptor: //Back pain? Visit your GOTO Velociraptor today!
+    return;
     
-    JITCompiler->ret();
-    JITCompiler->endFunc();
-    
-    
-    nativefunc = (void(*)(GC_Array_Header*))JITCompiler->make();
-    JITCompiler->make();
-    //printf("Wrote %i bytes of code\n",(int)JITCompiler->getAssembler()->getCodeSize());
-    //TODO: How to get size of output code?
   }
-  void(*nativefunc)(GC_Array_Header*);
+  void* nativefunc;
   
   /**
    * @summary Invokes this method with the specified arguments
@@ -1778,7 +1559,7 @@ public:
     if(nativefunc == 0) {
       Compile();
     }
-    nativefunc(arglist);
+    ((void(*)(void*))nativefunc)(arglist);
     return;
     
   }
@@ -1788,6 +1569,11 @@ public:
     for(size_t i = 0;i<l;i++) {
       delete nodes[i];
     }
+    
+    for(size_t i = 0;i<stringCount;i++) {
+      GC_Unmark((void**)(constantStrings+i),true);
+    }
+    delete[] constantStrings;
   }
 }; 
 
