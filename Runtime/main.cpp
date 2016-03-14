@@ -1007,6 +1007,72 @@ public:
 		  JITCompiler->jle(bnode->label);
 		}
 		  break;
+		  case Beq:
+		{
+		  //Check conditions
+		  asmjit::X86GpVar left = JITCompiler->newGpVar();
+		  asmjit::X86GpVar right = JITCompiler->newGpVar();
+		  
+		 //ldconst.12 -- Load constant 12, this seems to be ommitted for some reason.
+		  EmitNode(b->right,right);
+		  EmitNode(b->left,left);
+		  JITCompiler->cmp(right,left);
+		  JITCompiler->je(bnode->label);
+		}
+		  break;
+		  case Blt:
+		{
+		  //Check conditions
+		  asmjit::X86GpVar left = JITCompiler->newGpVar();
+		  asmjit::X86GpVar right = JITCompiler->newGpVar();
+		  
+		 //ldconst.12 -- Load constant 12, this seems to be ommitted for some reason.
+		  EmitNode(b->right,right);
+		  EmitNode(b->left,left);
+		  JITCompiler->cmp(right,left);
+		  JITCompiler->jl(bnode->label);
+		}
+		  break;
+		  case Bgt:
+		{
+		  //Check conditions
+		  asmjit::X86GpVar left = JITCompiler->newGpVar();
+		  asmjit::X86GpVar right = JITCompiler->newGpVar();
+		  
+		 //ldconst.12 -- Load constant 12, this seems to be ommitted for some reason.
+		  EmitNode(b->right,right);
+		  EmitNode(b->left,left);
+		  JITCompiler->cmp(right,left);
+		  JITCompiler->jg(bnode->label);
+		}
+		  break;
+		  case Bge:
+		{
+		  //Check conditions
+		  asmjit::X86GpVar left = JITCompiler->newGpVar();
+		  asmjit::X86GpVar right = JITCompiler->newGpVar();
+		  
+		 //ldconst.12 -- Load constant 12, this seems to be ommitted for some reason.
+		  EmitNode(b->right,right);
+		  EmitNode(b->left,left);
+		  JITCompiler->cmp(right,left);
+		  JITCompiler->jge(bnode->label);
+		}
+		  break;
+		  case Bne:
+		{
+		  //Check conditions
+		  asmjit::X86GpVar left = JITCompiler->newGpVar();
+		  asmjit::X86GpVar right = JITCompiler->newGpVar();
+		  
+		 //ldconst.12 -- Load constant 12, this seems to be ommitted for some reason.
+		  EmitNode(b->right,right);
+		  EmitNode(b->left,left);
+		  JITCompiler->cmp(right,left);
+		  JITCompiler->jne(bnode->label);
+		}
+		  break;
+		  
 		default:
 		printf("TODO: Implement branch\n");
 		abort();
