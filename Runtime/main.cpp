@@ -11,21 +11,9 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <dlfcn.h>
-#define GC_FAKE
-#include "../GC/GC.h"
 #include <set>
-#include "../asmjit/src/asmjit/asmjit.h"
-#define DEBUGMODE
 
 void* gc;
-
-//BEGIN PLATFORM CODE
-
-asmjit::JitRuntime* JITruntime;
-asmjit::X86Compiler* JITCompiler;
-
-
-//END PLATFORM CODE
 
 
 
@@ -84,34 +72,6 @@ public:
 
 class UALModule; //forward-declaration
 
-
-/**
- * @summary A safe garbage collected handle object for C++
- * */
-class SafeGCHandle {
-public:
-  void** obj;
-  template<typename T>
-  SafeGCHandle(T objref) {
-    this->obj = (void**)objref;
-    GC_Mark((void**)objref,true);
-  }
-  ~SafeGCHandle() {
-    GC_Unmark(obj,true);
-  }
-};
-
-
-
-
-typedef struct {
-  size_t count; //The number of elements in the array
-  size_t stride; //The size of each element in the array (in bytes), or zero if array of objects
-} GC_Array_Header;
-
-typedef struct {
-  uint32_t length;
-} GC_String_Header;
 
 
 /**
@@ -255,75 +215,6 @@ public:
 
 
 
-/**
- * Creates an array of primitives
- * */
-template<typename T>
-static inline void GC_Array_Create_Primitive(GC_Array_Header*& output, size_t count) {
-    GC_Allocate(sizeof(GC_Array_Header)+(sizeof(T)*count),0,(void**)&output,0);
-    output->count = count;
-    output->stride = sizeof(T);
-}
-/**
- * Creates an array of a managed datatype
- * */
-static inline void GC_Array_Create(GC_Array_Header*& output, size_t count) {
-  GC_Allocate(sizeof(GC_Array_Header),count,(void**)&output,0);
-  output->count = count;
-  output->stride = 0;
-}
-
-
-
-
-/**
- * Creates a String from a C-string
- * */
-static inline void GC_String_Create(GC_String_Header*& output, const char* cstr) {
-  //NOTE: This is out-of-spec. According to the ECMA specification for .NET -- strings should be encoded in UTF-16 format. Also; NULL-terminating the string isn't typical either; but whatever.
-  GC_Allocate(sizeof(GC_String_Header)+strlen(cstr)+1,0,(void**)&output,0);
-  output->length = strlen(cstr);
-  memcpy(output+1,cstr,output->length+1);
-}
-/**
- * Converts a String to a C-string
- * */
-static inline const char* GC_String_Cstr(GC_String_Header* ptr) {
-  return (const char*)(ptr+1);
-}
-
-
-
-/**
- * Retrieve non-managed object from array (unsafe)
- * */
-template<typename T>
-static inline T& GC_Array_Fetch(GC_Array_Header* header,size_t index) {
-  return ((T*)(header+1))[index];
-}
-/**
- * Retrieve managed object from array (unsafe)
- * */
-static inline void* GC_Array_Fetch(GC_Array_Header* header, size_t index) {
-  void** array = (void**)(header+1);
-  return array[index];
-}
-
-/**
- * Sets an object value in an array of managed objects
- * */
-template<typename T>
-static inline void GC_Array_Set(GC_Array_Header* header, size_t index, T* value) {
-  void** array = (void**)(header+1);
-  if(array[index]) {
-    GC_Unmark(array+index,false);
-  }
-  array[index] = value;
-  //TODO: BUG This is causing string truncation
-  GC_Mark(array+index,false);
-}
-
-
 
 class Type {
 public:
@@ -334,54 +225,9 @@ public:
   virtual ~Type(){};
 };
 
-class StackEntry {
-public:
-  unsigned char entryType; //Entry type
-  /**
-   * 0 -- Undefined
-   * 1 -- Managed object (pointer)
-   * */
-  
-  
-  void* value; //Value
-  StackEntry() {
-    entryType = 0;
-    value = 0;
-    type = 0;
-  }
-  void PutObject(void* obj) {
-    value = obj;
-    entryType = 1;
-    GC_Mark(&value,true);
-  }
-  void Release() {
-    if(entryType == 1) {
-      GC_Unmark(&value,true);
-    }
-  }
-  Type* type;
-};
 
 class UALMethod;
 static UALMethod* ResolveMethod(void* assembly, uint32_t handle);
-static std::map<std::string,void*> abi_ext;
-
-static void ConsoleOut(GC_String_Header* str) {
-  const char* mander = GC_String_Cstr(str); //Charmander is a constant. Always.
-  printf("%s",mander);
-}
-static void PrintDouble(uint64_t encoded) { //Print a double on the double.
-  double onthe = *(double*)&encoded;
-  printf("%f\n",onthe);
-}
-
-static void PrintInt(int eger) {
-  printf("%i",eger);
-}
-
-static void Ext_Invoke(const char* name, GC_Array_Header* args) {
-  ((void(*)(GC_Array_Header*))abi_ext[name])(args);
-}
 
 
 Type* ResolveType(const char* name);
@@ -399,7 +245,6 @@ public:
   Node* next;
   Node* prev;
   bool fpEmit; //Whether or not the expression's output should be saved to the floating point stack.
-  asmjit::Label label;
   bool bound;
   Node(NodeType type) {
     this->type = type;
@@ -539,30 +384,6 @@ public:
 
 
 
-
-
-
-class DeferredOperation {
-public:
-  virtual void Run(const asmjit::X86GpVar& output) = 0;
-  virtual ~DeferredOperation(){};
-};
-template<typename T>
-class DeferredOperationFunctor:public DeferredOperation {
-public:
-  T functor;
-DeferredOperationFunctor(const T& func):functor(func) {
-}
-  void Run(const asmjit::X86GpVar& output) {
-    functor(output);
-  }
-};
-
-template<typename T>
-static DeferredOperation* MakeDeferred(const T& functor) {
-  return new DeferredOperationFunctor<T>(functor);
-}
-
 class UALMethod {
 public:
   BStream str;
@@ -571,7 +392,6 @@ public:
   MethodSignature sig;
   uint32_t localVarCount;
   std::vector<std::string> locals;
-  asmjit::X86Compiler* JITCompiler;
   
   //BEGIN Optimization engine:
   std::vector<Node*> nodes;
@@ -583,7 +403,6 @@ public:
   //Adds an Instruction node to the tree
   T* Node_Instruction(arg... uments) {
     T* retval = new T(uments...);
-    retval->label = JITCompiler->newLabel();
     nodes.push_back(retval);
     if(instructions == 0) {
       instructions = retval;
@@ -599,7 +418,6 @@ public:
   template<typename T, typename... arg>
   T* Node_Stackop(arg... uments) {
     T* retval = new T(uments...);
-    retval->label = JITCompiler->newLabel();
     nodes.push_back(retval);
     stack.push_back(retval);
     ualOffsets[this->ualip] = retval;
@@ -631,7 +449,6 @@ public:
   
   UALMethod(const BStream& str, void* assembly, const char* sig) {
     this->instructions = 0;
-    this->JITCompiler = new asmjit::X86Compiler(JITruntime);
     this->sig = sig;
     this->str = str;
     this->str.Read(isManaged);
@@ -643,14 +460,10 @@ public:
       }
     }
     this->assembly = assembly;
-    nativefunc = 0;
-    constantStrings = 0;
-    stringCount = 0;
-    stringCapacity = 0;
+    
   }
   
   
-  GC_String_Header** constantStrings;
   void* constaddr;
   size_t stringCount;
   size_t stringCapacity;
@@ -668,467 +481,12 @@ public:
       stringCapacity*=2;
     }
   }
-  std::map<std::string,size_t> constantMappings;
   
-  size_t GetString(const char* str) {
-    if(constantMappings.find(str) != constantMappings.end()) {
-      return constantMappings[str];
-    }
-    if(constantStrings == 0) {
-      constantStrings = new GC_String_Header*[1];
-      GC_String_Create(constantStrings[0],str);
-      GC_Mark((void**)constantStrings,true);
-      stringCapacity = 1;
-    }else {
-      EnsureCapacity();
-      GC_String_Create(constantStrings[stringCount],str);
-    }
-    constantMappings[str] = stringCount;
-    stringCount++;
-    constaddr = constantStrings;
-    return stringCount-1;
-  }
   
   void Optimize() {
   }
-  asmjit::X86Mem stackmem;
-  size_t* stackOffsetTable;
-  size_t stackSize;
-  //Internal -- Emits x86 code for a MARK instruction given a specified register containing a memory address to mark
-  void EmitMark(asmjit::X86GpVar memreg, bool isRoot) {
-    asmjit::FuncBuilderX builder;
-    builder.addArg(asmjit::kVarTypeIntPtr);
-    builder.addArg(asmjit::kVarTypeIntPtr);
-    asmjit::X86CallNode* call = JITCompiler->call((size_t)&GC_Mark,asmjit::kFuncConvHost,builder);
-    call->setArg(0,memreg);
-    call->setArg(1,asmjit::imm(isRoot));
-  }
-  void EmitUnmark(asmjit::X86GpVar memreg, bool isRoot) {
-    asmjit::FuncBuilderX builder;
-    builder.addArg(asmjit::kVarTypeIntPtr);
-    builder.addArg(asmjit::kVarTypeIntPtr);
-    asmjit::X86CallNode* call = JITCompiler->call((size_t)&GC_Unmark,asmjit::kFuncConvHost,builder);
-    call->setArg(0,memreg);
-    call->setArg(1,asmjit::imm(isRoot));
-  }
-  //Internal -- Emits x86 code for a given tree node.
-  void EmitNode(Node* inst, asmjit::X86GpVar output) {
-    if(inst->bound) {
-      printf("BUG DETECTED: Tree turned into graph.....\n");
-      abort();
-    }
-    inst->bound = true;
-    JITCompiler->bind(inst->label);
-    
-    switch(inst->type) {
-	case NStLoc:
-	{
-	  StLoc* op = (StLoc*)inst;
-	  if(op->exp->resultType == "System.Double") {
-	    //Optimize for double
-	    op->exp->fpEmit = true;
-	    EmitNode(op->exp,output);
-	    
-	    if(op->exp->fpEmit) {
-	      printf("BUG DETECTED: Subtree did not emit floating point values to stack (or fpEmit flag not cleared).\n");
-	      abort();
-	    }
-	    asmjit::X86GpVar addr = JITCompiler->newGpVar();
-	  JITCompiler->lea(addr,stackmem);
-	  
-	    //Write floating point to memory
-	    JITCompiler->fstp(JITCompiler->intptr_ptr(addr,(int32_t)stackOffsetTable[op->idx]));
-	  }else {
-	  //Store result of expression into local variable
-	  asmjit::X86GpVar temp = JITCompiler->newGpVar();
-	  EmitNode(op->exp,temp);
-	  asmjit::X86GpVar addr = JITCompiler->newGpVar();
-	  JITCompiler->lea(addr,stackmem);
-	  JITCompiler->mov(JITCompiler->intptr_ptr(addr,(int32_t)stackOffsetTable[op->idx]),temp);
-	  if(!ResolveType(op->exp->resultType.data())->isStruct) {
-	    JITCompiler->add(addr,(int32_t)stackOffsetTable[op->idx]);
-	    EmitMark(addr,true);
-	  }
-	  }
-	}
-	  break;
-	  
-	    case NLdLoc:
-	    {
-	      //TODO: Load local variable
-	      LdLoc* op = (LdLoc*)inst;
-	      asmjit::X86GpVar addr = JITCompiler->newGpVar();
-	      JITCompiler->lea(addr,stackmem); //Load the effective base address of the stack
-	      if(op->fpEmit) {
-		//Store value into FPU
-		JITCompiler->fld(JITCompiler->intptr_ptr(addr,(int32_t)stackOffsetTable[op->idx]));
-		//Clear floating point flag
-		op->fpEmit = false;
-	      }else {
-		//Load the value from the base address into the output register
-		JITCompiler->mov(output,JITCompiler->intptr_ptr(addr,(int32_t)stackOffsetTable[op->idx])); 
-	      }
-	    }
-	      break;
-	case NConstantString:
-	{
-	  //Load constant string (we can now do this with only 2 instructions! Thanks to the constant pool.)
-	  asmjit::X86GpVar temp = JITCompiler->newGpVar();
-	  //Load base address of constant pool
-	  JITCompiler->mov(temp,asmjit::imm((size_t)&constaddr));
-	  //Get memory address of constant pool (array)
-	  JITCompiler->mov(temp,JITCompiler->intptr_ptr(temp));
-	  
-	  //Return absolute memory address of string (by dereferencing the index in the array)
-	  JITCompiler->mov(output,JITCompiler->intptr_ptr(temp,sizeof(size_t)*GetString(((ConstantString*)inst)->value)));
-	  
-	}
-	  break;
-	case NCallNode:
-	{
-	  //Function call
-	  CallNode* callme = (CallNode*)inst;
-	  asmjit::FuncBuilderX builder;
-	  for(size_t i = 0;i<callme->arguments.size();i++) {
-	    builder.addArg(asmjit::kVarTypeIntPtr);
-	  }
-	  UALMethod* method = callme->method;
-	  asmjit::X86GpVar* realargs = new asmjit::X86GpVar[method->sig.args.size()]; //varargs
-	  for(size_t i = 0;i<method->sig.args.size();i++) {
-	    realargs[i] = JITCompiler->newGpVar();
-	    EmitNode(callme->arguments[i],realargs[i]);
-	    
-	  }
-	  
-	  asmjit::X86CallNode* call = JITCompiler->call((size_t)abi_ext[method->sig.methodName],asmjit::kFuncConvHost,builder);
-	  
-	  //Bind arguments
-	  for(size_t i = 0;i<callme->arguments.size();i++) {
-	    call->setArg(i,realargs[i]);
-	  }
-	  delete[] realargs;
-	}
-	  break;
-	case NConstantInt:
-	{
-	  ConstantInt* ci = (ConstantInt*)inst;
-	  JITCompiler->mov(output,asmjit::imm(ci->value));
-	}
-	  break;
-	case NConstantDouble:
-	{
-	  ConstantDouble* cv = (ConstantDouble*)inst;
-	  //Load constant double
-	  uint64_t val = *(uint64_t*)&cv->value;
-	  if(cv->fpEmit) {
-	    cv->fpEmit = false;
-	    //NOTE: Assume instruction nodes stay constant in memory throughout program execution.
-	    asmjit::X86GpVar addr = JITCompiler->newGpVar();
-	    JITCompiler->mov(addr,asmjit::imm((size_t)&cv->value));
-	    JITCompiler->fld(JITCompiler->intptr_ptr(addr));
-	    
-	  }else {
-	    JITCompiler->mov(output,asmjit::imm(val));
-	  }
-	}
-	  break;
-	case NBinaryExpression:
-	{
-	  BinaryExpression* binexp = (BinaryExpression*)inst;
-	  switch(binexp->op) {
-	    case '+':
-	    {
-	      if(binexp->left->resultType == "System.Double") { //If we're a double, use the floating point unit instead of the processor.
-		binexp->left->fpEmit = true;
-		binexp->right->fpEmit = true;
-		EmitNode(binexp->right,output); //Evaluate Democratic candidates.
-		EmitNode(binexp->left,output); //Evaluate Republican candidates.
-		
-		if(binexp->left->fpEmit || binexp->right->fpEmit) {
-		  printf("BUG DETECTED: Subtree did not emit floating point values to stack (or fpEmit flag not cleared).\n");
-		  abort();
-		}
-		JITCompiler->faddp();
-		if(binexp->fpEmit) {
-		  binexp->fpEmit = false; //Let caller know that we've handled floating-point value.
-		}else {
-		  //Write value to output register
-		  asmjit::X86GpVar addr = JITCompiler->newGpVar();
-		  JITCompiler->lea(addr,stackmem);
-		  JITCompiler->fstp(JITCompiler->intptr_ptr(addr,stackSize));
-		  JITCompiler->mov(output,JITCompiler->intptr_ptr(addr,stackSize));
-		}
-	      }else {
-		//Use the ALU on the CPU rather than the FPU.
-		asmjit::X86GpVar r = JITCompiler->newGpVar();
-		EmitNode(binexp->left,output);
-		EmitNode(binexp->right,r);
-		JITCompiler->add(output,r);
-	      }
-	    }
-	      break;
-	      case '-':
-	    {
-	      if(binexp->left->resultType == "System.Double") { //If we're a double, use the floating point unit instead of the processor.
-		binexp->left->fpEmit = true;
-		binexp->right->fpEmit = true;
-		EmitNode(binexp->right,output); //Evaluate Democratic candidates.
-		EmitNode(binexp->left,output); //Evaluate Republican candidates.
-		
-		if(binexp->left->fpEmit || binexp->right->fpEmit) {
-		  printf("BUG DETECTED: Subtree did not emit floating point values to stack (or fpEmit flag not cleared).\n");
-		  abort();
-		}
-		JITCompiler->fsubp();
-		if(binexp->fpEmit) {
-		  binexp->fpEmit = false; //Let caller know that we've handled floating-point value.
-		}else {
-		  //Write value to output register
-		  asmjit::X86GpVar addr = JITCompiler->newGpVar();
-		  JITCompiler->lea(addr,stackmem);
-		  JITCompiler->fstp(JITCompiler->intptr_ptr(addr,stackSize));
-		  JITCompiler->mov(output,JITCompiler->intptr_ptr(addr,stackSize));
-		}
-	      }else {
-		//Use the ALU on the CPU rather than the FPU.
-		asmjit::X86GpVar r = JITCompiler->newGpVar();
-		EmitNode(binexp->left,output);
-		EmitNode(binexp->right,r);
-		JITCompiler->sub(output,r);
-	      }
-	    }
-	      break;
-	      case '*':
-	    {
-	      if(binexp->left->resultType == "System.Double") { //If we're a double, use the floating point unit instead of the processor.
-		binexp->left->fpEmit = true;
-		binexp->right->fpEmit = true;
-		EmitNode(binexp->right,output); //Evaluate Democratic candidates.
-		EmitNode(binexp->left,output); //Evaluate Republican candidates.
-		
-		if(binexp->left->fpEmit || binexp->right->fpEmit) {
-		  printf("BUG DETECTED: Subtree did not emit floating point values to stack (or fpEmit flag not cleared).\n");
-		  abort();
-		}
-		JITCompiler->fmulp();
-		if(binexp->fpEmit) {
-		  binexp->fpEmit = false; //Let caller know that we've handled floating-point value.
-		}else {
-		  //Write value to output register
-		  asmjit::X86GpVar addr = JITCompiler->newGpVar();
-		  JITCompiler->lea(addr,stackmem);
-		  JITCompiler->fstp(JITCompiler->intptr_ptr(addr,stackSize));
-		  JITCompiler->mov(output,JITCompiler->intptr_ptr(addr,stackSize));
-		}
-	      }else {
-		//Use the ALU on the CPU rather than the FPU.
-		asmjit::X86GpVar r = JITCompiler->newGpVar();
-		EmitNode(binexp->left,output);
-		EmitNode(binexp->right,r);
-		JITCompiler->imul(output,r);
-	      }
-	    }
-	      break;
-	      case '/':
-	    {
-	      if(binexp->left->resultType == "System.Double") { //If we're a double, use the floating point unit instead of the processor.
-		binexp->left->fpEmit = true;
-		binexp->right->fpEmit = true;
-		EmitNode(binexp->right,output); //Evaluate Democratic candidates.
-		EmitNode(binexp->left,output); //Evaluate Republican candidates.
-		
-		if(binexp->left->fpEmit || binexp->right->fpEmit) {
-		  printf("BUG DETECTED: Subtree did not emit floating point values to stack (or fpEmit flag not cleared).\n");
-		  abort();
-		}
-		JITCompiler->fdivp();
-		if(binexp->fpEmit) {
-		  binexp->fpEmit = false; //Let caller know that we've handled floating-point value.
-		}else {
-		  //Write value to output register
-		  asmjit::X86GpVar addr = JITCompiler->newGpVar();
-		  JITCompiler->lea(addr,stackmem);
-		  JITCompiler->fstp(JITCompiler->intptr_ptr(addr,stackSize));
-		  JITCompiler->mov(output,JITCompiler->intptr_ptr(addr,stackSize));
-		}
-	      }else {
-		//Use the ALU on the CPU rather than the FPU.
-		asmjit::X86GpVar r = JITCompiler->newGpVar();
-		EmitNode(binexp->left,output);
-		EmitNode(binexp->right,r);
-		asmjit::X86GpVar reminder = JITCompiler->newGpVar();
-		JITCompiler->xor_(reminder,reminder);
-		JITCompiler->idiv(reminder,output,r);
-	      }
-	    }
-	      break;
-	      case '%':
-	    {
-	     //Use the ALU on the CPU rather than the FPU.
-		asmjit::X86GpVar r = JITCompiler->newGpVar();
-		EmitNode(binexp->left,output);
-		EmitNode(binexp->right,r);
-		asmjit::X86GpVar reminder = JITCompiler->newGpVar();
-		JITCompiler->xor_(reminder,reminder);
-		JITCompiler->idiv(reminder,output,r);
-		JITCompiler->mov(output,reminder);
-	    }
-	      break;
-	    default:
-	      printf("Operator %c not implemented yet....\n",binexp->op);
-	      abort();
-	  }
-	}
-	  break;
-	    case NBranch:
-	    {
-	      Branch* b = (Branch*)inst;
-	      if(ualOffsets.find(b->offset) == ualOffsets.end()) {
-		throw "Illegal UAL offset";
-	      }
-	      Node* bnode = this->ualOffsets[b->offset]; //Node to branch to
-	      switch(b->condition) {
-		case UnconditionalSurrender:
-		{
-		  
-		  JITCompiler->jmp(bnode->label);
-		}
-		  break;
-		case Ble:
-		{
-		  //Check conditions
-		  asmjit::X86GpVar left = JITCompiler->newGpVar();
-		  asmjit::X86GpVar right = JITCompiler->newGpVar();
-		  
-		 //ldconst.12 -- Load constant 12, this seems to be ommitted for some reason.
-		  EmitNode(b->right,right);
-		  EmitNode(b->left,left);
-		  JITCompiler->cmp(right,left);
-		  JITCompiler->jle(bnode->label);
-		}
-		  break;
-		  case Beq:
-		{
-		  //Check conditions
-		  asmjit::X86GpVar left = JITCompiler->newGpVar();
-		  asmjit::X86GpVar right = JITCompiler->newGpVar();
-		  
-		 //ldconst.12 -- Load constant 12, this seems to be ommitted for some reason.
-		  EmitNode(b->right,right);
-		  EmitNode(b->left,left);
-		  JITCompiler->cmp(right,left);
-		  JITCompiler->je(bnode->label);
-		}
-		  break;
-		  case Blt:
-		{
-		  //Check conditions
-		  asmjit::X86GpVar left = JITCompiler->newGpVar();
-		  asmjit::X86GpVar right = JITCompiler->newGpVar();
-		  
-		 //ldconst.12 -- Load constant 12, this seems to be ommitted for some reason.
-		  EmitNode(b->right,right);
-		  EmitNode(b->left,left);
-		  JITCompiler->cmp(right,left);
-		  JITCompiler->jl(bnode->label);
-		}
-		  break;
-		  case Bgt:
-		{
-		  //Check conditions
-		  asmjit::X86GpVar left = JITCompiler->newGpVar();
-		  asmjit::X86GpVar right = JITCompiler->newGpVar();
-		  
-		 //ldconst.12 -- Load constant 12, this seems to be ommitted for some reason.
-		  EmitNode(b->right,right);
-		  EmitNode(b->left,left);
-		  JITCompiler->cmp(right,left);
-		  JITCompiler->jg(bnode->label);
-		}
-		  break;
-		  case Bge:
-		{
-		  //Check conditions
-		  asmjit::X86GpVar left = JITCompiler->newGpVar();
-		  asmjit::X86GpVar right = JITCompiler->newGpVar();
-		  
-		 //ldconst.12 -- Load constant 12, this seems to be ommitted for some reason.
-		  EmitNode(b->right,right);
-		  EmitNode(b->left,left);
-		  JITCompiler->cmp(right,left);
-		  JITCompiler->jge(bnode->label);
-		}
-		  break;
-		  case Bne:
-		{
-		  //Check conditions
-		  asmjit::X86GpVar left = JITCompiler->newGpVar();
-		  asmjit::X86GpVar right = JITCompiler->newGpVar();
-		  
-		 //ldconst.12 -- Load constant 12, this seems to be ommitted for some reason.
-		  EmitNode(b->right,right);
-		  EmitNode(b->left,left);
-		  JITCompiler->cmp(right,left);
-		  JITCompiler->jne(bnode->label);
-		}
-		  break;
-		  
-		default:
-		printf("TODO: Implement branch\n");
-		abort();
-	      }
-	      
-	    }
-	      break;
-		case NOPE:
-		  //Not gonna do that
-		  break;
-	default:
-	  printf("Unknown tree instruction.\n");
-	  abort();
-      }
-  }
   void Emit() {
-    asmjit::FuncBuilderX builder;
-    for(size_t i = 0;i<this->sig.args.size();i++) {
-      builder.addArg(asmjit::kVarTypeIntPtr);
-    }
-    
-    JITCompiler->addFunc(asmjit::kFuncConvHost,builder);
-    
-    //BEGIN set up stack
-    
-    stackOffsetTable = new size_t[localVarCount];
-    stackSize = 0;
-    {
-      size_t cOffset = 0;
-      for(size_t i = 0;i<localVarCount;i++) {
-	Type* tdef = ResolveType(this->locals[i].data());
-	size_t requiredSize = 0;
-	if(tdef->isStruct) {
-	  requiredSize = tdef->size;
-	}else {
-	  requiredSize = sizeof(size_t);
-	}
-	requiredSize+=(requiredSize % 8); //Align stack to largest size possible primitive datatype.
-	
-	stackSize+=requiredSize;
-	stackOffsetTable[i] = cOffset;
-	cOffset+=requiredSize;
-      }
-    }
-    stackmem = JITCompiler->newStack(stackSize+(sizeof(double)*2),8);
-    //END set up stack
-    //BEGIN code emit
-    
-    asmjit::X86GpVar output = JITCompiler->newGpVar();
-    for(Node* inst = instructions;inst != 0;inst = inst->next) {
-      
-      EmitNode(inst,output);
-    }
-    //END Code emit
-    JITCompiler->endFunc();
-    nativefunc = JITCompiler->make();
+  
   }
   void Compile() {
     Parse();
@@ -1609,37 +967,19 @@ public:
     return;
     
   }
-  void* nativefunc;
-  
   /**
    * @summary Invokes this method with the specified arguments
    * @param args Array of arguments
    * */
   void Invoke(GC_Array_Header* arglist) {
     
-    if(!isManaged) {
-      Ext_Invoke(sig.methodName.data(), arglist);
-      return;
-      
-    }
-    if(nativefunc == 0) {
-      Compile();
-    }
-    ((void(*)(void*))nativefunc)(arglist);
-    return;
-    
   }
   ~UALMethod() {
-    delete JITCompiler;
     size_t l = nodes.size();
     for(size_t i = 0;i<l;i++) {
       delete nodes[i];
     }
     
-    for(size_t i = 0;i<stringCount;i++) {
-      GC_Unmark((void**)(constantStrings+i),true);
-    }
-    delete[] constantStrings;
   }
 }; 
 
@@ -1755,20 +1095,6 @@ public:
       }
       
     
-      //Invoke main
-      GC_Array_Header* array;
-      GC_Array_Create(array,argc);
-      SafeGCHandle arrhandle(&array);
-      for(size_t i = 0;i<array->count;i++) {
-	GC_String_Header* managedString;
-	GC_String_Create(managedString,argv[i]);
-	SafeGCHandle stringHandle(&managedString);
-	GC_Array_Set(array,i,managedString);
-      }
-      GC_Array_Header* argarray;
-      GC_Array_Create(argarray,1);
-      GC_Array_Set(argarray,0,array);
-      mainMethod->Invoke(argarray);
   }
 };
 
@@ -1804,8 +1130,6 @@ int main(int argc, char** argv) {
   printf("%i\n",ret);
   return 0;
   */
-  JITruntime = new asmjit::JitRuntime();
-  JITCompiler = new asmjit::X86Compiler(JITruntime);
   
  /* asmjit::FuncBuilderX fbuilder;
   fbuilder.setRet(asmjit::kVarTypeIntPtr);
@@ -1834,9 +1158,6 @@ int main(int argc, char** argv) {
   
   return 0;*/
   //Register built-ins
-  abi_ext["ConsoleOut"] = (void*)ConsoleOut;
-  abi_ext["PrintInt"] = (void*)PrintInt;
-  abi_ext["PrintDouble"] = (void*)PrintDouble;
   
   UALType* btype = new UALType();
   btype->isStruct = true;
@@ -1866,7 +1187,6 @@ int main(int argc, char** argv) {
   fstat(fd,&us);
   size_t len = us.st_size;
   void* ptr = mmap(0,len,PROT_READ,MAP_SHARED,fd,0);
-  gc = GC_Init(3);
   UALModule* module = new UALModule(ptr,len);
   module->LoadMain(argc-2,argv+2);
   return 0;
