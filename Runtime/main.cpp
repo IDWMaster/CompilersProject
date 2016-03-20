@@ -1,4 +1,3 @@
-#include "Runtime.h"
 #include <stdio.h>
 #include <map>
 #include <string.h>
@@ -50,7 +49,7 @@ public:
   void* Increment(size_t len) {
     void* retval = this->ptr;
     if(len>this->len) {
-      throw "up"; //barf
+      throw "Increment -- Read past end of file"; //barf
     }
     this->len-=len;
     this->ptr+=len; 
@@ -423,6 +422,7 @@ public:
     ualOffsets[this->ualip] = retval;
     return retval;
   }
+  uint32_t ualip;
   template<typename T>
   //Removes an instruction node
   T* Node_RemoveInstruction(T* node) {
@@ -452,6 +452,7 @@ public:
     this->sig = sig;
     this->str = str;
     this->str.Read(isManaged);
+    ualip = 0;
     if(isManaged) {
       this->str.Read(localVarCount);
       locals.resize(localVarCount);
@@ -463,24 +464,7 @@ public:
     
   }
   
-  
-  void* constaddr;
-  size_t stringCount;
-  size_t stringCapacity;
-  uint32_t ualip; //Instruction pointer into UAL
-  void EnsureCapacity() {
-    if(stringCount == stringCapacity) {
-      GC_String_Header** newList = new GC_String_Header*[stringCapacity*2];
-      for(size_t i = 0;i<stringCount;i++) {
-	newList[i] = constantStrings[i];
-	GC_Unmark((void**)(constantStrings+i),true);
-	GC_Mark((void**)(newList+i),true);
-      }
-      delete[] constantStrings;
-      constantStrings = newList;
-      stringCapacity*=2;
-    }
-  }
+
   
   
   void Optimize() {
@@ -967,13 +951,7 @@ public:
     return;
     
   }
-  /**
-   * @summary Invokes this method with the specified arguments
-   * @param args Array of arguments
-   * */
-  void Invoke(GC_Array_Header* arglist) {
-    
-  }
+
   ~UALMethod() {
     size_t l = nodes.size();
     for(size_t i = 0;i<l;i++) {
@@ -1043,9 +1021,9 @@ public:
 #ifdef DEBUGMODE
     printf("Reading in %i classes\n",(int)count);
 #endif
+
     for(uint32_t i = 0;i<count;i++) {
       char* name = str.ReadString();
-
       uint32_t asmlen;
       str.Read(asmlen);
       
@@ -1054,14 +1032,15 @@ public:
       printf("Loading %s\n",name);
       #endif
       UALType* type = new UALType(obj,this);
+
       types[std::string(name)] = type;
       typeCache[std::string(name)] = type;
-      
-      
+
     }
+
     str.Read(count);
     printf("Reading %i methods\n",count);
-    
+
     for(uint32_t i = 0;i<count;i++) {
       uint32_t id;
       str.Read(id);
@@ -1093,8 +1072,6 @@ public:
 	printf("Error: Unable to find Main.\n");
 	return;
       }
-      
-    
   }
 };
 
@@ -1108,86 +1085,35 @@ static UALMethod* ResolveMethod(void* assembly, uint32_t handle) {
   return methodCache[signature];
 }
 
+void Print(const char* txt);
+void RunModule(int fd, int offset) {
+    try {
 
-int main(int argc, char** argv) {
-  //JIT test
-  /*asmjit::JitRuntime runtime;
-  asmjit::X86Compiler compiler(&runtime);
-  asmjit::FuncBuilderX builder;
-  builder.addArg(asmjit::kVarTypeIntPtr);
-  builder.addArg(asmjit::kVarTypeIntPtr);
-  builder.setRet(asmjit::kVarTypeIntPtr);
-  compiler.addFunc(asmjit::kFuncConvHost,builder);
-  asmjit::X86GpVar a = compiler.newGpVar();
-  asmjit::X86GpVar b = compiler.newGpVar();
-  compiler.setArg(0,a);
-  compiler.setArg(1,b);
-  compiler.add(a,b);
-  compiler.ret(a);
-  compiler.endFunc();
-  size_t(*addfunc)(size_t,size_t) = (size_t(*)(size_t,size_t))compiler.make();
-  int ret = (int)addfunc(5,2);
-  printf("%i\n",ret);
-  return 0;
-  */
-  
- /* asmjit::FuncBuilderX fbuilder;
-  fbuilder.setRet(asmjit::kVarTypeIntPtr);
-  JITCompiler->addFunc(asmjit::kFuncConvHost,fbuilder);
-  double a = 5.2;
-  double b = 3.2;
-  double answer = -1;
-  asmjit::X86GpVar aaddr = JITCompiler->newGpVar();
-  asmjit::X86GpVar baddr = JITCompiler->newGpVar();
-  asmjit::X86GpVar answeraddr = JITCompiler->newGpVar();
-  
-  JITCompiler->mov(aaddr,asmjit::imm((size_t)(void*)&a));
-  JITCompiler->mov(baddr,(size_t)&b);
-  JITCompiler->mov(answeraddr,(size_t)&answer);
-  JITCompiler->fld(JITCompiler->intptr_ptr(aaddr));
-  JITCompiler->fld(JITCompiler->intptr_ptr(baddr));
-  JITCompiler->faddp();
-  JITCompiler->fst(JITCompiler->intptr_ptr(answeraddr));
-  JITCompiler->ret();
-  JITCompiler->endFunc();
-  void(*fptr)() = (void(*)())JITCompiler->make();
-  fptr();
-  
-  printf("%f\n",answer);
-  
-  
-  return 0;*/
-  //Register built-ins
-  
-  UALType* btype = new UALType();
-  btype->isStruct = true;
-  btype->size = 4; //32-bit integer.
-  btype->name = "System.Int32";
-  typeCache["System.Int32"] = btype;
-  btype = new UALType();
-  btype->isStruct = false;
-  btype->size = sizeof(size_t); //A String just has a single pointer.
-  btype->name = "System.String";
-  typeCache["System.String"] = btype;
-  btype = new UALType();
-  btype->isStruct = true;
-  btype->size = 8;
-  btype->name = "System.Double";
-  typeCache["System.Double"] = btype;
-  
-  
-  int fd = 0;
-  if(argc>1) {
-  fd = open(argv[1],O_RDONLY);
-  }else {
-    //Debug mode, open ual.out in current directory
-    fd = open(argv[1],O_RDONLY);
-  }
-  struct stat us; //It's a MAC (status symbol)
-  fstat(fd,&us);
-  size_t len = us.st_size;
-  void* ptr = mmap(0,len,PROT_READ,MAP_SHARED,fd,0);
-  UALModule* module = new UALModule(ptr,len);
-  module->LoadMain(argc-2,argv+2);
-  return 0;
+
+        UALType *btype = new UALType();
+        btype->isStruct = true;
+        btype->size = 4; //32-bit integer.
+        btype->name = "System.Int32";
+        typeCache["System.Int32"] = btype;
+        btype = new UALType();
+        btype->isStruct = false;
+        btype->size = sizeof(size_t); //A String just has a single pointer.
+        btype->name = "System.String";
+        typeCache["System.String"] = btype;
+        btype = new UALType();
+        btype->isStruct = true;
+        btype->size = 8;
+        btype->name = "System.Double";
+        typeCache["System.Double"] = btype;
+
+
+        struct stat us; //It's a MAC (status symbol)
+        fstat(fd, &us);
+        size_t len = us.st_size;
+        void *ptr = mmap(0, len, PROT_READ, MAP_SHARED, fd, 0);
+
+        UALModule *module = new UALModule(ptr+offset, len-offset);
+    }catch(const char* er) {
+        Print(er);
+    }
 }
