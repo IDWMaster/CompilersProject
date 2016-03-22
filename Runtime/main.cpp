@@ -11,7 +11,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <dlfcn.h>
-#define GC_FAKE
+//#define GC_FAKE
 #include "../GC/GC.h"
 #include <set>
 #include "../asmjit/src/asmjit/asmjit.h"
@@ -682,6 +682,7 @@ public:
     }else {
       EnsureCapacity();
       GC_String_Create(constantStrings[stringCount],str);
+      GC_Mark((void**)constantStrings+stringCount,true);
     }
     constantMappings[str] = stringCount;
     stringCount++;
