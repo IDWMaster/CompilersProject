@@ -571,7 +571,7 @@ public:
   MethodSignature sig;
   uint32_t localVarCount;
   std::vector<std::string> locals;
-  asmjit::X86Compiler* JITCompiler;
+  //asmjit::X86Compiler* JITCompiler;
   
   //BEGIN Optimization engine:
   std::vector<Node*> nodes;
@@ -579,6 +579,7 @@ public:
   Node* instructions;
   Node* lastInstruction;
   std::map<uint32_t,Node*> ualOffsets;
+  asmjit::X86GpVar* arg_regs;
   template<typename T, typename... arg>
   //Adds an Instruction node to the tree
   T* Node_Instruction(arg... uments) {
@@ -627,20 +628,24 @@ public:
   }
   //END Optimization engine
   
-  
+  asmjit::Label funcStart; //Function entry point (for managed functions)
   
   UALMethod(const BStream& str, void* assembly, const char* sig) {
+    
     this->instructions = 0;
-    this->JITCompiler = new asmjit::X86Compiler(JITruntime);
+    this->funcStart = JITCompiler->newLabel();
+   // this->JITCompiler = new asmjit::X86Compiler(JITruntime);
     this->sig = sig;
     this->str = str;
     this->str.Read(isManaged);
+    arg_regs = new asmjit::X86GpVar[this->sig.args.size()];
     if(isManaged) {
       this->str.Read(localVarCount);
       locals.resize(localVarCount);
       for(size_t i = 0;i<localVarCount;i++) {
 	locals[i] = this->str.ReadString();
       }
+      
     }
     this->assembly = assembly;
     nativefunc = 0;
@@ -771,6 +776,18 @@ public:
 	      }
 	    }
 	      break;
+	    case NLdArg:
+	    {
+	      LdArg* op = (LdArg*)inst;
+	      if(op->fpEmit) {
+		printf("TODO: Floating point arguments\n");
+		abort();
+	      }else {
+		//Load the value from the base address into the output register
+		JITCompiler->mov(output,arg_regs[op->index]); 
+	      }
+	    }
+	      break;
 	case NConstantString:
 	{
 	  //Load constant string (we can now do this with only 2 instructions! Thanks to the constant pool.)
@@ -793,7 +810,11 @@ public:
 	  for(size_t i = 0;i<callme->arguments.size();i++) {
 	    builder.addArg(asmjit::kVarTypeIntPtr);
 	  }
+	  
 	  UALMethod* method = callme->method;
+	  if(method->sig.returnType != "System.Void") {
+	    builder.setRet(asmjit::kVarTypeIntPtr);
+	  }
 	  asmjit::X86GpVar* realargs = new asmjit::X86GpVar[method->sig.args.size()]; //varargs
 	  for(size_t i = 0;i<method->sig.args.size();i++) {
 	    realargs[i] = JITCompiler->newGpVar();
@@ -801,8 +822,16 @@ public:
 	    
 	  }
 	  
-	  asmjit::X86CallNode* call = JITCompiler->call((size_t)abi_ext[method->sig.methodName],asmjit::kFuncConvHost,builder);
-	  
+	  asmjit::X86CallNode* call;
+	  if(callme->method->isManaged) {
+	   // printf("Managed method %s\n",method->sig.methodName.data());
+	    call = JITCompiler->call(method->funcStart,asmjit::kFuncConvHost,builder);
+	    if(callme->method->sig.returnType != "System.Void") {
+	      call->setRet(0,output);
+	    }
+	  }else {
+	    call = JITCompiler->call((size_t)abi_ext[method->sig.methodName],asmjit::kFuncConvHost,builder);
+	  }
 	  //Bind arguments
 	  for(size_t i = 0;i<callme->arguments.size();i++) {
 	    call->setArg(i,realargs[i]);
@@ -1084,6 +1113,14 @@ public:
 		case NOPE:
 		  //Not gonna do that
 		  break;
+		case NRet:
+		{
+		  asmjit::X86GpVar retreg = JITCompiler->newGpVar();
+		  Ret* val = (Ret*)inst;
+		  EmitNode(val->resultExpression,retreg);
+		  JITCompiler->ret(retreg);
+		}
+		  break;
 	default:
 	  printf("Unknown tree instruction.\n");
 	  abort();
@@ -1091,10 +1128,13 @@ public:
   }
   void Emit() {
     asmjit::FuncBuilderX builder;
+    if(sig.returnType != "System.Void") {
+      builder.setRet(asmjit::kVarTypeIntPtr);
+    }
     for(size_t i = 0;i<this->sig.args.size();i++) {
       builder.addArg(asmjit::kVarTypeIntPtr);
     }
-    
+    JITCompiler->bind(this->funcStart);
     JITCompiler->addFunc(asmjit::kFuncConvHost,builder);
     
     //BEGIN set up stack
@@ -1120,6 +1160,14 @@ public:
     }
     stackmem = JITCompiler->newStack(stackSize+(sizeof(double)*2),8);
     //END set up stack
+    //BEGIN VARIABLES
+    for(size_t i = 0;i<sig.args.size();i++) {
+      arg_regs[i] = JITCompiler->newGpVar();
+      JITCompiler->setArg(i,arg_regs[i]);
+    }
+    //END VARIABLES
+    
+    
     //BEGIN code emit
     
     asmjit::X86GpVar output = JITCompiler->newGpVar();
@@ -1181,7 +1229,10 @@ public:
 	    Node_RemoveInstruction(args[i]);
 	  }
 	  Node* sobj = Node_Instruction<CallNode>(method,args);
-	  
+	  if(method->sig.returnType != "System.Void") {
+	    sobj->resultType = method->sig.returnType;
+	    stack.push_back(sobj); //Hybrid instruction
+	  }
 	  
 	}
 	  break;
@@ -1207,7 +1258,7 @@ public:
 		throw "Malformed UAL. Function does not return correct datatype.";
 	      }
 	      Node_Instruction<Ret>(Node_RemoveInstruction(stack[0]));
-	      
+	      stack.pop_back();
 	    }
 	}
 	  break;
@@ -1631,7 +1682,7 @@ public:
     
   }
   ~UALMethod() {
-    delete JITCompiler;
+   // delete JITCompiler;
     size_t l = nodes.size();
     for(size_t i = 0;i<l;i++) {
       delete nodes[i];
@@ -1677,9 +1728,13 @@ public:
       
       void* ptr = bstr.Increment(mlen);
       UALMethod* method = new UALMethod(BStream(ptr,mlen),module,mname);
+      
       method->sig = mname;
       methods[mname] = method;
       methodCache[mname] = method;
+      if(method->isManaged) {
+	method->Compile();
+      }
     }
     }
   }
