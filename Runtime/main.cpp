@@ -594,6 +594,10 @@ public:
       retval->prev = lastInstruction;
       lastInstruction = retval;
     }
+    if(ualOffsets.find(this->ualip) != ualOffsets.end()) {
+      printf("ERROR: Insanity.\n");
+      throw "sideways";
+    }
     ualOffsets[this->ualip] = retval;
     return retval;
   }
@@ -603,6 +607,11 @@ public:
     retval->label = JITCompiler->newLabel();
     nodes.push_back(retval);
     stack.push_back(retval);
+    
+    if(ualOffsets.find(this->ualip) != ualOffsets.end()) {
+      printf("ERROR: Insanity.\n");
+      throw "sideways";
+    }
     ualOffsets[this->ualip] = retval;
     return retval;
   }
@@ -891,8 +900,8 @@ public:
 	      }else {
 		//Use the ALU on the CPU rather than the FPU.
 		asmjit::X86GpVar r = JITCompiler->newGpVar();
-		EmitNode(binexp->left,output);
-		EmitNode(binexp->right,r);
+		EmitNode(binexp->left,r);
+		EmitNode(binexp->right,output);
 		JITCompiler->add(output,r);
 	      }
 	    }
@@ -922,8 +931,14 @@ public:
 	      }else {
 		//Use the ALU on the CPU rather than the FPU.
 		asmjit::X86GpVar r = JITCompiler->newGpVar();
-		EmitNode(binexp->left,output);
-		EmitNode(binexp->right,r);
+		
+		
+		EmitNode(binexp->left,r);
+		JITCompiler->int3();
+		JITCompiler->nop();
+		JITCompiler->nop();
+		EmitNode(binexp->right,output);
+		
 		JITCompiler->sub(output,r);
 	      }
 	    }
@@ -953,8 +968,8 @@ public:
 	      }else {
 		//Use the ALU on the CPU rather than the FPU.
 		asmjit::X86GpVar r = JITCompiler->newGpVar();
-		EmitNode(binexp->left,output);
-		EmitNode(binexp->right,r);
+		EmitNode(binexp->left,r);
+		EmitNode(binexp->right,output);
 		JITCompiler->imul(output,r);
 	      }
 	    }
@@ -984,8 +999,8 @@ public:
 	      }else {
 		//Use the ALU on the CPU rather than the FPU.
 		asmjit::X86GpVar r = JITCompiler->newGpVar();
-		EmitNode(binexp->left,output);
-		EmitNode(binexp->right,r);
+		EmitNode(binexp->left,r);
+		EmitNode(binexp->right,output);
 		asmjit::X86GpVar reminder = JITCompiler->newGpVar();
 		JITCompiler->xor_(reminder,reminder);
 		JITCompiler->idiv(reminder,output,r);
@@ -996,8 +1011,8 @@ public:
 	    {
 	     //Use the ALU on the CPU rather than the FPU.
 		asmjit::X86GpVar r = JITCompiler->newGpVar();
-		EmitNode(binexp->left,output);
-		EmitNode(binexp->right,r);
+		EmitNode(binexp->left,r);
+		EmitNode(binexp->right,output);
 		asmjit::X86GpVar reminder = JITCompiler->newGpVar();
 		JITCompiler->xor_(reminder,reminder);
 		JITCompiler->idiv(reminder,output,r);
@@ -1115,10 +1130,17 @@ public:
 		  break;
 		case NRet:
 		{
-		  asmjit::X86GpVar retreg = JITCompiler->newGpVar();
 		  Ret* val = (Ret*)inst;
-		  EmitNode(val->resultExpression,retreg);
-		  JITCompiler->ret(retreg);
+		  if(val->resultExpression) {
+		    
+		  asmjit::X86GpVar retreg = JITCompiler->newGpVar();
+		  
+		    EmitNode(val->resultExpression,retreg);
+		    JITCompiler->ret(retreg);
+		  }else {
+		    JITCompiler->ret();
+		  }
+		  
 		}
 		  break;
 	default:
@@ -1221,12 +1243,12 @@ public:
 	    if(stack.size() == 0) {
 	      throw "Malformed UAL. Too few arguments in function call.";
 	    }
-	    args[i] = stack[stack.size()-1];
-	    if(args[i]->resultType != method->sig.args[i]) {
+	    args[argcount-i-1] = stack[stack.size()-1];
+	    if(args[argcount-i-1]->resultType != method->sig.args[argcount-i-1]) {
 	      throw "Malformed UAL. Illegal data type passed to function.";
 	    }
 	    stack.pop_back();
-	    Node_RemoveInstruction(args[i]);
+	    Node_RemoveInstruction(args[argcount-i-1]);
 	  }
 	  Node* sobj = Node_Instruction<CallNode>(method,args);
 	  if(method->sig.returnType != "System.Void") {
@@ -1246,6 +1268,7 @@ public:
 	case 3:
 	{
 	  if(this->sig.returnType == "System.Void") {
+	    Node_Instruction<Ret>((Node*)0);
 	    //There should be nothing on stack
 	    if(stack.size()) {
 	      throw "Malformed UAL. Function should not return a value.";
@@ -1675,7 +1698,7 @@ public:
       
     }
     if(nativefunc == 0) {
-      Compile();
+      throw "up";
     }
     ((void(*)(void*))nativefunc)(arglist);
     return;
