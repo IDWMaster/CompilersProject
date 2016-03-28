@@ -11,7 +11,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <dlfcn.h>
-//#define GC_FAKE
+#define GC_FAKE
 #include "../GC/GC.h"
 #include <set>
 #include "../asmjit/src/asmjit/asmjit.h"
@@ -23,7 +23,7 @@ void* gc;
 
 asmjit::JitRuntime* JITruntime;
 asmjit::X86Compiler* JITCompiler;
-
+asmjit::X86Assembler* JITAssembler;
 
 //END PLATFORM CODE
 
@@ -392,22 +392,36 @@ Type* ResolveType(const char* name);
 enum NodeType {
   NCallNode, NConstantInt, NConstantDouble, NConstantString, NLdLoc, NStLoc, NLdArg, NRet, NBranch, NBinaryExpression, NOPE
 };
+
+
+
 class Node {
 public:
+  
   NodeType type;
   std::string resultType;
   Node* next;
   Node* prev;
   bool fpEmit; //Whether or not the expression's output should be saved to the floating point stack.
   asmjit::Label label;
-  bool bound;
+  bool referenced; //Whether or not this label has been referenced already
+  bool bound; //Whether or not this label has been bound
+  
+  
+  
   Node(NodeType type) {
     this->type = type;
     this->next = 0;
     this->prev = 0;
     this->fpEmit = false;
-    bound = false;
+    this->bound = false;
+    this->referenced = false;	
+    
+    //JITCompiler->nop();
+    label = JITCompiler->newLabel();
+    
   }
+  
   virtual ~Node(){};
 };
 
@@ -563,6 +577,8 @@ static DeferredOperation* MakeDeferred(const T& functor) {
   return new DeferredOperationFunctor<T>(functor);
 }
 
+
+
 class UALMethod {
 public:
   BStream str;
@@ -584,7 +600,6 @@ public:
   //Adds an Instruction node to the tree
   T* Node_Instruction(arg... uments) {
     T* retval = new T(uments...);
-    retval->label = JITCompiler->newLabel();
     nodes.push_back(retval);
     if(instructions == 0) {
       instructions = retval;
@@ -604,7 +619,6 @@ public:
   template<typename T, typename... arg>
   T* Node_Stackop(arg... uments) {
     T* retval = new T(uments...);
-    retval->label = JITCompiler->newLabel();
     nodes.push_back(retval);
     stack.push_back(retval);
     
@@ -642,7 +656,6 @@ public:
   UALMethod(const BStream& str, void* assembly, const char* sig) {
     
     this->instructions = 0;
-    this->funcStart = JITCompiler->newLabel();
    // this->JITCompiler = new asmjit::X86Compiler(JITruntime);
     this->sig = sig;
     this->str = str;
@@ -714,7 +727,7 @@ public:
     asmjit::FuncBuilderX builder;
     builder.addArg(asmjit::kVarTypeIntPtr);
     builder.addArg(asmjit::kVarTypeIntPtr);
-    asmjit::X86CallNode* call = JITCompiler->call((size_t)&GC_Mark,asmjit::kFuncConvHost,builder);
+    asmjit::X86CallNode* call = JITCompiler->call((size_t)&GC_Mark,builder);
     call->setArg(0,memreg);
     call->setArg(1,asmjit::imm(isRoot));
   }
@@ -722,18 +735,22 @@ public:
     asmjit::FuncBuilderX builder;
     builder.addArg(asmjit::kVarTypeIntPtr);
     builder.addArg(asmjit::kVarTypeIntPtr);
-    asmjit::X86CallNode* call = JITCompiler->call((size_t)&GC_Unmark,asmjit::kFuncConvHost,builder);
+    asmjit::X86CallNode* call = JITCompiler->call((size_t)&GC_Unmark,builder);
     call->setArg(0,memreg);
     call->setArg(1,asmjit::imm(isRoot));
   }
+  
+  asmjit::HLNode* currentNode;
+  
+  
   //Internal -- Emits x86 code for a given tree node.
   void EmitNode(Node* inst, asmjit::X86GpVar output) {
     if(inst->bound) {
-      printf("BUG DETECTED: Tree turned into graph.....\n");
       abort();
     }
-    inst->bound = true;
-    JITCompiler->bind(inst->label);
+      JITCompiler->bind(inst->label);
+      inst->bound = true;
+    
     
     switch(inst->type) {
 	case NStLoc:
@@ -748,16 +765,16 @@ public:
 	      printf("BUG DETECTED: Subtree did not emit floating point values to stack (or fpEmit flag not cleared).\n");
 	      abort();
 	    }
-	    asmjit::X86GpVar addr = JITCompiler->newGpVar();
+	    asmjit::X86GpVar addr = JITCompiler->newIntPtr();
 	  JITCompiler->lea(addr,stackmem);
 	  
 	    //Write floating point to memory
 	    JITCompiler->fstp(JITCompiler->intptr_ptr(addr,(int32_t)stackOffsetTable[op->idx]));
 	  }else {
 	  //Store result of expression into local variable
-	  asmjit::X86GpVar temp = JITCompiler->newGpVar();
+	  asmjit::X86GpVar temp = JITCompiler->newIntPtr();
 	  EmitNode(op->exp,temp);
-	  asmjit::X86GpVar addr = JITCompiler->newGpVar();
+	  asmjit::X86GpVar addr = JITCompiler->newIntPtr();
 	  JITCompiler->lea(addr,stackmem);
 	  JITCompiler->mov(JITCompiler->intptr_ptr(addr,(int32_t)stackOffsetTable[op->idx]),temp);
 	  if(!ResolveType(op->exp->resultType.data())->isStruct) {
@@ -772,7 +789,7 @@ public:
 	    {
 	      //TODO: Load local variable
 	      LdLoc* op = (LdLoc*)inst;
-	      asmjit::X86GpVar addr = JITCompiler->newGpVar();
+	      asmjit::X86GpVar addr = JITCompiler->newIntPtr();
 	      JITCompiler->lea(addr,stackmem); //Load the effective base address of the stack
 	      if(op->fpEmit) {
 		//Store value into FPU
@@ -800,7 +817,7 @@ public:
 	case NConstantString:
 	{
 	  //Load constant string (we can now do this with only 2 instructions! Thanks to the constant pool.)
-	  asmjit::X86GpVar temp = JITCompiler->newGpVar();
+	  asmjit::X86GpVar temp = JITCompiler->newIntPtr();
 	  //Load base address of constant pool
 	  JITCompiler->mov(temp,asmjit::imm((size_t)&constaddr));
 	  //Get memory address of constant pool (array)
@@ -826,7 +843,7 @@ public:
 	  }
 	  asmjit::X86GpVar* realargs = new asmjit::X86GpVar[method->sig.args.size()]; //varargs
 	  for(size_t i = 0;i<method->sig.args.size();i++) {
-	    realargs[i] = JITCompiler->newGpVar();
+	    realargs[i] = JITCompiler->newIntPtr();
 	    EmitNode(callme->arguments[i],realargs[i]);
 	    
 	  }
@@ -834,12 +851,12 @@ public:
 	  asmjit::X86CallNode* call;
 	  if(callme->method->isManaged) {
 	   // printf("Managed method %s\n",method->sig.methodName.data());
-	    call = JITCompiler->call(method->funcStart,asmjit::kFuncConvHost,builder);
+	    call = JITCompiler->call(method->funcStart,builder);
 	    if(callme->method->sig.returnType != "System.Void") {
 	      call->setRet(0,output);
 	    }
 	  }else {
-	    call = JITCompiler->call((size_t)abi_ext[method->sig.methodName],asmjit::kFuncConvHost,builder);
+	    call = JITCompiler->call((size_t)abi_ext[method->sig.methodName],builder);
 	  }
 	  //Bind arguments
 	  for(size_t i = 0;i<callme->arguments.size();i++) {
@@ -862,7 +879,7 @@ public:
 	  if(cv->fpEmit) {
 	    cv->fpEmit = false;
 	    //NOTE: Assume instruction nodes stay constant in memory throughout program execution.
-	    asmjit::X86GpVar addr = JITCompiler->newGpVar();
+	    asmjit::X86GpVar addr = JITCompiler->newIntPtr();
 	    JITCompiler->mov(addr,asmjit::imm((size_t)&cv->value));
 	    JITCompiler->fld(JITCompiler->intptr_ptr(addr));
 	    
@@ -892,14 +909,14 @@ public:
 		  binexp->fpEmit = false; //Let caller know that we've handled floating-point value.
 		}else {
 		  //Write value to output register
-		  asmjit::X86GpVar addr = JITCompiler->newGpVar();
+		  asmjit::X86GpVar addr = JITCompiler->newIntPtr();
 		  JITCompiler->lea(addr,stackmem);
 		  JITCompiler->fstp(JITCompiler->intptr_ptr(addr,stackSize));
 		  JITCompiler->mov(output,JITCompiler->intptr_ptr(addr,stackSize));
 		}
 	      }else {
 		//Use the ALU on the CPU rather than the FPU.
-		asmjit::X86GpVar r = JITCompiler->newGpVar();
+		asmjit::X86GpVar r = JITCompiler->newIntPtr();
 		EmitNode(binexp->left,r);
 		EmitNode(binexp->right,output);
 		JITCompiler->add(output,r);
@@ -923,14 +940,14 @@ public:
 		  binexp->fpEmit = false; //Let caller know that we've handled floating-point value.
 		}else {
 		  //Write value to output register
-		  asmjit::X86GpVar addr = JITCompiler->newGpVar();
+		  asmjit::X86GpVar addr = JITCompiler->newIntPtr();
 		  JITCompiler->lea(addr,stackmem);
 		  JITCompiler->fstp(JITCompiler->intptr_ptr(addr,stackSize));
 		  JITCompiler->mov(output,JITCompiler->intptr_ptr(addr,stackSize));
 		}
 	      }else {
 		//Use the ALU on the CPU rather than the FPU.
-		asmjit::X86GpVar r = JITCompiler->newGpVar();
+		asmjit::X86GpVar r = JITCompiler->newIntPtr();
 		
 		
 		EmitNode(binexp->left,r);
@@ -960,14 +977,14 @@ public:
 		  binexp->fpEmit = false; //Let caller know that we've handled floating-point value.
 		}else {
 		  //Write value to output register
-		  asmjit::X86GpVar addr = JITCompiler->newGpVar();
+		  asmjit::X86GpVar addr = JITCompiler->newIntPtr();
 		  JITCompiler->lea(addr,stackmem);
 		  JITCompiler->fstp(JITCompiler->intptr_ptr(addr,stackSize));
 		  JITCompiler->mov(output,JITCompiler->intptr_ptr(addr,stackSize));
 		}
 	      }else {
 		//Use the ALU on the CPU rather than the FPU.
-		asmjit::X86GpVar r = JITCompiler->newGpVar();
+		asmjit::X86GpVar r = JITCompiler->newIntPtr();
 		EmitNode(binexp->left,r);
 		EmitNode(binexp->right,output);
 		JITCompiler->imul(output,r);
@@ -991,17 +1008,17 @@ public:
 		  binexp->fpEmit = false; //Let caller know that we've handled floating-point value.
 		}else {
 		  //Write value to output register
-		  asmjit::X86GpVar addr = JITCompiler->newGpVar();
+		  asmjit::X86GpVar addr = JITCompiler->newIntPtr();
 		  JITCompiler->lea(addr,stackmem);
 		  JITCompiler->fstp(JITCompiler->intptr_ptr(addr,stackSize));
 		  JITCompiler->mov(output,JITCompiler->intptr_ptr(addr,stackSize));
 		}
 	      }else {
 		//Use the ALU on the CPU rather than the FPU.
-		asmjit::X86GpVar r = JITCompiler->newGpVar();
+		asmjit::X86GpVar r = JITCompiler->newIntPtr();
 		EmitNode(binexp->left,r);
 		EmitNode(binexp->right,output);
-		asmjit::X86GpVar reminder = JITCompiler->newGpVar();
+		asmjit::X86GpVar reminder = JITCompiler->newIntPtr();
 		JITCompiler->xor_(reminder,reminder);
 		JITCompiler->idiv(reminder,output,r);
 	      }
@@ -1010,10 +1027,10 @@ public:
 	      case '%':
 	    {
 	     //Use the ALU on the CPU rather than the FPU.
-		asmjit::X86GpVar r = JITCompiler->newGpVar();
+		asmjit::X86GpVar r = JITCompiler->newIntPtr();
 		EmitNode(binexp->left,r);
 		EmitNode(binexp->right,output);
-		asmjit::X86GpVar reminder = JITCompiler->newGpVar();
+		asmjit::X86GpVar reminder = JITCompiler->newIntPtr();
 		JITCompiler->xor_(reminder,reminder);
 		JITCompiler->idiv(reminder,output,r);
 		JITCompiler->mov(output,reminder);
@@ -1042,8 +1059,8 @@ public:
 		case Ble:
 		{
 		  //Check conditions
-		  asmjit::X86GpVar left = JITCompiler->newGpVar();
-		  asmjit::X86GpVar right = JITCompiler->newGpVar();
+		  asmjit::X86GpVar left = JITCompiler->newIntPtr();
+		  asmjit::X86GpVar right = JITCompiler->newIntPtr();
 		  
 		 //ldconst.12 -- Load constant 12, this seems to be ommitted for some reason.
 		  EmitNode(b->right,right);
@@ -1055,8 +1072,8 @@ public:
 		  case Beq:
 		{
 		  //Check conditions
-		  asmjit::X86GpVar left = JITCompiler->newGpVar();
-		  asmjit::X86GpVar right = JITCompiler->newGpVar();
+		  asmjit::X86GpVar left = JITCompiler->newIntPtr();
+		  asmjit::X86GpVar right = JITCompiler->newIntPtr();
 		  
 		 //ldconst.12 -- Load constant 12, this seems to be ommitted for some reason.
 		  EmitNode(b->right,right);
@@ -1068,8 +1085,8 @@ public:
 		  case Blt:
 		{
 		  //Check conditions
-		  asmjit::X86GpVar left = JITCompiler->newGpVar();
-		  asmjit::X86GpVar right = JITCompiler->newGpVar();
+		  asmjit::X86GpVar left = JITCompiler->newIntPtr();
+		  asmjit::X86GpVar right = JITCompiler->newIntPtr();
 		  
 		 //ldconst.12 -- Load constant 12, this seems to be ommitted for some reason.
 		  EmitNode(b->right,right);
@@ -1081,8 +1098,8 @@ public:
 		  case Bgt:
 		{
 		  //Check conditions
-		  asmjit::X86GpVar left = JITCompiler->newGpVar();
-		  asmjit::X86GpVar right = JITCompiler->newGpVar();
+		  asmjit::X86GpVar left = JITCompiler->newIntPtr();
+		  asmjit::X86GpVar right = JITCompiler->newIntPtr();
 		  
 		 //ldconst.12 -- Load constant 12, this seems to be ommitted for some reason.
 		  EmitNode(b->right,right);
@@ -1094,8 +1111,8 @@ public:
 		  case Bge:
 		{
 		  //Check conditions
-		  asmjit::X86GpVar left = JITCompiler->newGpVar();
-		  asmjit::X86GpVar right = JITCompiler->newGpVar();
+		  asmjit::X86GpVar left = JITCompiler->newIntPtr();
+		  asmjit::X86GpVar right = JITCompiler->newIntPtr();
 		  
 		 //ldconst.12 -- Load constant 12, this seems to be ommitted for some reason.
 		  EmitNode(b->right,right);
@@ -1107,8 +1124,8 @@ public:
 		  case Bne:
 		{
 		  //Check conditions
-		  asmjit::X86GpVar left = JITCompiler->newGpVar();
-		  asmjit::X86GpVar right = JITCompiler->newGpVar();
+		  asmjit::X86GpVar left = JITCompiler->newIntPtr();
+		  asmjit::X86GpVar right = JITCompiler->newIntPtr();
 		  
 		 //ldconst.12 -- Load constant 12, this seems to be ommitted for some reason.
 		  EmitNode(b->right,right);
@@ -1133,7 +1150,7 @@ public:
 		  Ret* val = (Ret*)inst;
 		  if(val->resultExpression) {
 		    
-		  asmjit::X86GpVar retreg = JITCompiler->newGpVar();
+		  asmjit::X86GpVar retreg = JITCompiler->newIntPtr();
 		  
 		    EmitNode(val->resultExpression,retreg);
 		    JITCompiler->ret(retreg);
@@ -1148,7 +1165,9 @@ public:
 	  abort();
       }
   }
+
   void Emit() {
+    currentNode = 0;
     asmjit::FuncBuilderX builder;
     if(sig.returnType != "System.Void") {
       builder.setRet(asmjit::kVarTypeIntPtr);
@@ -1156,8 +1175,10 @@ public:
     for(size_t i = 0;i<this->sig.args.size();i++) {
       builder.addArg(asmjit::kVarTypeIntPtr);
     }
-    JITCompiler->bind(this->funcStart);
-    JITCompiler->addFunc(asmjit::kFuncConvHost,builder);
+    JITCompiler->nop();
+    this->funcStart = JITCompiler->addFunc(builder)->getEntryLabel();
+    
+    
     
     //BEGIN set up stack
     
@@ -1184,7 +1205,7 @@ public:
     //END set up stack
     //BEGIN VARIABLES
     for(size_t i = 0;i<sig.args.size();i++) {
-      arg_regs[i] = JITCompiler->newGpVar();
+      arg_regs[i] = JITCompiler->newIntPtr();
       JITCompiler->setArg(i,arg_regs[i]);
     }
     //END VARIABLES
@@ -1192,14 +1213,15 @@ public:
     
     //BEGIN code emit
     
-    asmjit::X86GpVar output = JITCompiler->newGpVar();
+    asmjit::X86GpVar output = JITCompiler->newIntPtr();
     for(Node* inst = instructions;inst != 0;inst = inst->next) {
       
       EmitNode(inst,output);
     }
     //END Code emit
     JITCompiler->endFunc();
-    nativefunc = JITCompiler->make();
+    JITCompiler->finalize();
+    nativefunc = JITAssembler->make();
   }
   void Compile() {
     Parse();
@@ -1871,8 +1893,8 @@ int main(int argc, char** argv) {
   builder.addArg(asmjit::kVarTypeIntPtr);
   builder.setRet(asmjit::kVarTypeIntPtr);
   compiler.addFunc(asmjit::kFuncConvHost,builder);
-  asmjit::X86GpVar a = compiler.newGpVar();
-  asmjit::X86GpVar b = compiler.newGpVar();
+  asmjit::X86GpVar a = compiler.newIntPtr();
+  asmjit::X86GpVar b = compiler.newIntPtr();
   compiler.setArg(0,a);
   compiler.setArg(1,b);
   compiler.add(a,b);
@@ -1884,7 +1906,12 @@ int main(int argc, char** argv) {
   return 0;
   */
   JITruntime = new asmjit::JitRuntime();
-  JITCompiler = new asmjit::X86Compiler(JITruntime);
+  JITAssembler = new asmjit::X86Assembler(JITruntime);
+  JITCompiler = new asmjit::X86Compiler(JITAssembler);
+  for(size_t i = 0;i<17;i++) {
+    JITCompiler->newLabel();
+  }
+  
   
  /* asmjit::FuncBuilderX fbuilder;
   fbuilder.setRet(asmjit::kVarTypeIntPtr);
@@ -1892,9 +1919,9 @@ int main(int argc, char** argv) {
   double a = 5.2;
   double b = 3.2;
   double answer = -1;
-  asmjit::X86GpVar aaddr = JITCompiler->newGpVar();
-  asmjit::X86GpVar baddr = JITCompiler->newGpVar();
-  asmjit::X86GpVar answeraddr = JITCompiler->newGpVar();
+  asmjit::X86GpVar aaddr = JITCompiler->newIntPtr();
+  asmjit::X86GpVar baddr = JITCompiler->newIntPtr();
+  asmjit::X86GpVar answeraddr = JITCompiler->newIntPtr();
   
   JITCompiler->mov(aaddr,asmjit::imm((size_t)(void*)&a));
   JITCompiler->mov(baddr,(size_t)&b);
