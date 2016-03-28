@@ -1,3 +1,4 @@
+#define ASMJIT_TRACE
 #include "Runtime.h"
 #include <stdio.h>
 #include <map>
@@ -1149,7 +1150,6 @@ public:
 		  if(val->resultExpression) {
 		    
 		  asmjit::X86GpVar retreg = JITCompiler->newIntPtr();
-		  
 		    EmitNode(val->resultExpression,retreg);
 		    JITCompiler->ret(retreg);
 		  }else {
@@ -1164,6 +1164,7 @@ public:
       }
   }
 asmjit::Label funcStart;
+asmjit::X86FuncNode* fnode;
   void Emit() {
     currentNode = 0;
     asmjit::FuncBuilderX builder;
@@ -1174,7 +1175,7 @@ asmjit::Label funcStart;
       builder.addArg(asmjit::kVarTypeIntPtr);
     }
     JITCompiler->bind(funcStart);
-    asmjit::X86FuncNode* fnode = JITCompiler->addFunc(builder);
+    fnode = JITCompiler->addFunc(builder);
     for(size_t i = 0;i<sig.args.size();i++) {
       arg_regs[i] = JITCompiler->newIntPtr();
       JITCompiler->setArg(i,arg_regs[i]); //TODO: Something here with args causes assertion failure about register ID.
