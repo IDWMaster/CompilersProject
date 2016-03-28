@@ -1175,7 +1175,10 @@ asmjit::Label funcStart;
     }
     JITCompiler->bind(funcStart);
     asmjit::X86FuncNode* fnode = JITCompiler->addFunc(builder);
-    
+    for(size_t i = 0;i<sig.args.size();i++) {
+      arg_regs[i] = JITCompiler->newIntPtr();
+      JITCompiler->setArg(i,arg_regs[i]); //TODO: Something here with args causes assertion failure about register ID.
+    }
     //BEGIN set up stack
     
     stackOffsetTable = new size_t[localVarCount];
@@ -1200,10 +1203,7 @@ asmjit::Label funcStart;
     stackmem = JITCompiler->newStack(stackSize+(sizeof(double)*2),8);
     //END set up stack
     //BEGIN VARIABLES
-    for(size_t i = 0;i<sig.args.size();i++) {
-      arg_regs[i] = JITCompiler->newIntPtr();
-      JITCompiler->setArg(i,arg_regs[i]);
-    }
+    
     //END VARIABLES
     
     
@@ -1217,8 +1217,6 @@ asmjit::Label funcStart;
     //END Code emit
     JITCompiler->endFunc();
     
-    JITCompiler->finalize(); //TODO: We have to do this later if we have more than one function.
-    nativefunc = JITAssembler->make(); //TODO: We'll have to get rid of this later, and find an alternative ABI for native methods rather than a raw function pointer.
   }
   void Compile() {
     Parse();
@@ -1777,17 +1775,18 @@ public:
       
       if(method->isManaged) {
 	method->Compile();
+	
       }
+      
     }
     
     
-      //TODO: Jump on the table
-      /*
+      JITCompiler->finalize();
+      size_t start = (size_t)JITAssembler->make();
       for(auto i = methods.begin();i != methods.end();i++) {
 	UALMethod* meth = i->second;
-	JITCompiler->jmp(meth->funcStart);
-      }*/
-      
+	meth->nativefunc = (void*)(start+JITAssembler->getLabelOffset(meth->funcStart));
+      }
     
     }
   }
@@ -1916,8 +1915,12 @@ int main(int argc, char** argv) {
   JITruntime = new asmjit::JitRuntime();
   JITAssembler = new asmjit::X86Assembler(JITruntime);
   JITCompiler = new asmjit::X86Compiler(JITAssembler);
+  
+  
+  
   asmjit::FileLogger logger(stdout);
   JITAssembler->setLogger(&logger);
+  
   
   
  /* asmjit::FuncBuilderX fbuilder;
