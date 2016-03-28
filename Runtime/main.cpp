@@ -651,10 +651,8 @@ public:
   }
   //END Optimization engine
   
-  asmjit::Label funcStart; //Function entry point (for managed functions)
-  
   UALMethod(const BStream& str, void* assembly, const char* sig) {
-    
+    this->funcStart = JITCompiler->newLabel();
     this->instructions = 0;
    // this->JITCompiler = new asmjit::X86Compiler(JITruntime);
     this->sig = sig;
@@ -1165,7 +1163,7 @@ public:
 	  abort();
       }
   }
-
+asmjit::Label funcStart;
   void Emit() {
     currentNode = 0;
     asmjit::FuncBuilderX builder;
@@ -1175,10 +1173,8 @@ public:
     for(size_t i = 0;i<this->sig.args.size();i++) {
       builder.addArg(asmjit::kVarTypeIntPtr);
     }
-    JITCompiler->nop();
-    this->funcStart = JITCompiler->addFunc(builder)->getEntryLabel();
-    
-    
+    JITCompiler->bind(funcStart);
+    asmjit::X86FuncNode* fnode = JITCompiler->addFunc(builder);
     
     //BEGIN set up stack
     
@@ -1220,8 +1216,9 @@ public:
     }
     //END Code emit
     JITCompiler->endFunc();
-    JITCompiler->finalize();
-    nativefunc = JITAssembler->make();
+    
+    JITCompiler->finalize(); //TODO: We have to do this later if we have more than one function.
+    nativefunc = JITAssembler->make(); //TODO: We'll have to get rid of this later, and find an alternative ABI for native methods rather than a raw function pointer.
   }
   void Compile() {
     Parse();
@@ -1777,10 +1774,21 @@ public:
       method->sig = mname;
       methods[mname] = method;
       methodCache[mname] = method;
+      
       if(method->isManaged) {
 	method->Compile();
       }
     }
+    
+    
+      //TODO: Jump on the table
+      /*
+      for(auto i = methods.begin();i != methods.end();i++) {
+	UALMethod* meth = i->second;
+	JITCompiler->jmp(meth->funcStart);
+      }*/
+      
+    
     }
   }
 };
@@ -1908,9 +1916,8 @@ int main(int argc, char** argv) {
   JITruntime = new asmjit::JitRuntime();
   JITAssembler = new asmjit::X86Assembler(JITruntime);
   JITCompiler = new asmjit::X86Compiler(JITAssembler);
-  for(size_t i = 0;i<17;i++) {
-    JITCompiler->newLabel();
-  }
+  asmjit::FileLogger logger(stdout);
+  JITAssembler->setLogger(&logger);
   
   
  /* asmjit::FuncBuilderX fbuilder;
