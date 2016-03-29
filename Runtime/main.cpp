@@ -1235,6 +1235,7 @@ asmjit::X86FuncNode* fnode;
     //Generate parse tree
     unsigned char opcode;
     unsigned char* base = str.ptr;
+    
     BStream reader = str;
     while(reader.Read(opcode) != 255) {
       ualip = (uint32_t)((size_t)reader.ptr-(size_t)base)-1;
