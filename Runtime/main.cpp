@@ -12,7 +12,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <dlfcn.h>
-#define GC_FAKE
+//#define GC_FAKE
 #include "../GC/GC.h"
 #include <set>
 #include "../asmjit/src/asmjit/asmjit.h"
@@ -391,7 +391,7 @@ Type* ResolveType(const char* name);
 //A parse tree node
 
 enum NodeType {
-  NCallNode, NConstantInt, NConstantDouble, NConstantString, NLdLoc, NStLoc, NLdArg, NRet, NBranch, NBinaryExpression, NOPE
+  NCallNode, NConstantInt, NConstantDouble, NConstantString, NLdLoc, NStLoc, NLdArg, NRet, NBranch, NBinaryExpression, NOPE, NConstantBuffer
 };
 
 
@@ -451,7 +451,14 @@ public:
     resultType = "System.String";
   }
 };
-
+class ConstantBuffer:public Node {
+public:
+  size_t idx; //Index of the buffer into the constant pool
+  ConstantBuffer(size_t idx):Node(NodeType::NConstantBuffer) {
+    this->idx = idx;
+    this->resultType = "System.Blob";
+  }
+};
 class LdLoc:public Node {
 public:
   size_t idx; //The index of the local field to load from
@@ -676,7 +683,7 @@ public:
   }
   
   
-  GC_String_Header** constantStrings;
+  GC_String_Header** constantStrings; //List of all constant managed objects
   void* constaddr;
   size_t stringCount;
   size_t stringCapacity;
@@ -713,6 +720,17 @@ public:
     constantMappings[str] = stringCount;
     stringCount++;
     constaddr = constantStrings;
+    return stringCount-1;
+  }
+  //Allocates a Buffer.
+  size_t AllocBuffer(void* bytes, size_t sz) {
+    EnsureCapacity();
+    GC_Array_Header* header;
+    GC_Array_Create_Primitive<unsigned char>(header,sz);
+    memcpy(header+1,bytes,sz);
+    constantStrings[stringCount] = (GC_String_Header*)header; //Whatever. We know it's not a string, but it's all just memory addresses anyways.
+    GC_Mark((void**)(constantStrings+stringCount),true);
+    stringCount++;
     return stringCount-1;
   }
   
@@ -1699,7 +1717,14 @@ asmjit::X86FuncNode* fnode;
 	      
 	    }
 	      break;
-	
+	    case 26:
+	    {
+	      uint32_t sz;
+	      reader.Read(sz);
+	      void* bufferBytes = reader.Increment(sz);
+	      Node_Stackop<ConstantBuffer>(AllocBuffer(bufferBytes,sz));
+	    }
+	      break;
 	default:
 	  printf("Unknown OPCODE %i\n",(int)opcode);
 	  goto velociraptor;
@@ -1850,7 +1875,6 @@ public:
   }
   void LoadMain(int argc, char** argv) {
     //Find main
-    //TODO: Parse method signatures from strings
       UALType* mainClass = 0;
       UALMethod* mainMethod = 0;
       for(auto i = types.begin();i!= types.end();i++) {
