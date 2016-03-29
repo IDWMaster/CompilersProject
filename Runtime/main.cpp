@@ -949,11 +949,12 @@ public:
 		asmjit::X86GpVar r = JITCompiler->newIntPtr();
 		
 		
-		EmitNode(binexp->left,r);
-		JITCompiler->int3();
-		JITCompiler->nop();
-		JITCompiler->nop();
 		EmitNode(binexp->right,output);
+		//JITCompiler->int3();
+		//JITCompiler->nop();
+		//JITCompiler->nop();
+		
+		EmitNode(binexp->left,r);
 		
 		JITCompiler->sub(output,r);
 	      }
@@ -1228,7 +1229,6 @@ asmjit::X86FuncNode* fnode;
     Optimize();
     Emit();
   }
-  
   
   void Parse() {
     
