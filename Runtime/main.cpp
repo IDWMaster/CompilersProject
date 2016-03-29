@@ -1,3 +1,4 @@
+#define ASMJIT_TRACE
 #include "Runtime.h"
 #include <stdio.h>
 #include <map>
@@ -11,7 +12,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <dlfcn.h>
-#define GC_FAKE
+//#define GC_FAKE
 #include "../GC/GC.h"
 #include <set>
 #include "../asmjit/src/asmjit/asmjit.h"
@@ -390,7 +391,7 @@ Type* ResolveType(const char* name);
 //A parse tree node
 
 enum NodeType {
-  NCallNode, NConstantInt, NConstantDouble, NConstantString, NLdLoc, NStLoc, NLdArg, NRet, NBranch, NBinaryExpression, NOPE
+  NCallNode, NConstantInt, NConstantDouble, NConstantString, NLdLoc, NStLoc, NLdArg, NRet, NBranch, NBinaryExpression, NOPE, NConstantBuffer
 };
 
 
@@ -450,7 +451,14 @@ public:
     resultType = "System.String";
   }
 };
-
+class ConstantBuffer:public Node {
+public:
+  size_t idx; //Index of the buffer into the constant pool
+  ConstantBuffer(size_t idx):Node(NodeType::NConstantBuffer) {
+    this->idx = idx;
+    this->resultType = "System.Blob";
+  }
+};
 class LdLoc:public Node {
 public:
   size_t idx; //The index of the local field to load from
@@ -651,10 +659,8 @@ public:
   }
   //END Optimization engine
   
-  asmjit::Label funcStart; //Function entry point (for managed functions)
-  
   UALMethod(const BStream& str, void* assembly, const char* sig) {
-    
+    this->funcStart = JITCompiler->newLabel();
     this->instructions = 0;
    // this->JITCompiler = new asmjit::X86Compiler(JITruntime);
     this->sig = sig;
@@ -677,7 +683,7 @@ public:
   }
   
   
-  GC_String_Header** constantStrings;
+  GC_String_Header** constantStrings; //List of all constant managed objects
   void* constaddr;
   size_t stringCount;
   size_t stringCapacity;
@@ -714,6 +720,17 @@ public:
     constantMappings[str] = stringCount;
     stringCount++;
     constaddr = constantStrings;
+    return stringCount-1;
+  }
+  //Allocates a Buffer.
+  size_t AllocBuffer(void* bytes, size_t sz) {
+    EnsureCapacity();
+    GC_Array_Header* header;
+    GC_Array_Create_Primitive<unsigned char>(header,sz);
+    memcpy(header+1,bytes,sz);
+    constantStrings[stringCount] = (GC_String_Header*)header; //Whatever. We know it's not a string, but it's all just memory addresses anyways.
+    GC_Mark((void**)(constantStrings+stringCount),true);
+    stringCount++;
     return stringCount-1;
   }
   
@@ -897,6 +914,8 @@ public:
 	      if(binexp->left->resultType == "System.Double") { //If we're a double, use the floating point unit instead of the processor.
 		binexp->left->fpEmit = true;
 		binexp->right->fpEmit = true;
+		
+		//NOTE: ORDER DOES MATTER! Republicans always have to be evaluated before Democrats!
 		EmitNode(binexp->right,output); //Evaluate Democratic candidates.
 		EmitNode(binexp->left,output); //Evaluate Republican candidates.
 		
@@ -917,8 +936,9 @@ public:
 	      }else {
 		//Use the ALU on the CPU rather than the FPU.
 		asmjit::X86GpVar r = JITCompiler->newIntPtr();
-		EmitNode(binexp->left,r);
+		
 		EmitNode(binexp->right,output);
+		EmitNode(binexp->left,r);
 		JITCompiler->add(output,r);
 	      }
 	    }
@@ -950,11 +970,9 @@ public:
 		asmjit::X86GpVar r = JITCompiler->newIntPtr();
 		
 		
-		EmitNode(binexp->left,r);
-		JITCompiler->int3();
-		JITCompiler->nop();
-		JITCompiler->nop();
 		EmitNode(binexp->right,output);
+		
+		EmitNode(binexp->left,r);
 		
 		JITCompiler->sub(output,r);
 	      }
@@ -985,8 +1003,9 @@ public:
 	      }else {
 		//Use the ALU on the CPU rather than the FPU.
 		asmjit::X86GpVar r = JITCompiler->newIntPtr();
-		EmitNode(binexp->left,r);
+		
 		EmitNode(binexp->right,output);
+		EmitNode(binexp->left,r);
 		JITCompiler->imul(output,r);
 	      }
 	    }
@@ -1016,8 +1035,9 @@ public:
 	      }else {
 		//Use the ALU on the CPU rather than the FPU.
 		asmjit::X86GpVar r = JITCompiler->newIntPtr();
-		EmitNode(binexp->left,r);
+		
 		EmitNode(binexp->right,output);
+		EmitNode(binexp->left,r);
 		asmjit::X86GpVar reminder = JITCompiler->newIntPtr();
 		JITCompiler->xor_(reminder,reminder);
 		JITCompiler->idiv(reminder,output,r);
@@ -1028,8 +1048,9 @@ public:
 	    {
 	     //Use the ALU on the CPU rather than the FPU.
 		asmjit::X86GpVar r = JITCompiler->newIntPtr();
-		EmitNode(binexp->left,r);
+		
 		EmitNode(binexp->right,output);
+		EmitNode(binexp->left,r);
 		asmjit::X86GpVar reminder = JITCompiler->newIntPtr();
 		JITCompiler->xor_(reminder,reminder);
 		JITCompiler->idiv(reminder,output,r);
@@ -1053,7 +1074,8 @@ public:
 		case UnconditionalSurrender:
 		{
 		  
-		  JITCompiler->jmp(bnode->label);
+		  JITCompiler->jmp(bnode->label); //TODO: This jmp instruction seems to get rid of assembly instructions
+		  
 		}
 		  break;
 		case Ble:
@@ -1151,7 +1173,6 @@ public:
 		  if(val->resultExpression) {
 		    
 		  asmjit::X86GpVar retreg = JITCompiler->newIntPtr();
-		  
 		    EmitNode(val->resultExpression,retreg);
 		    JITCompiler->ret(retreg);
 		  }else {
@@ -1165,7 +1186,8 @@ public:
 	  abort();
       }
   }
-
+asmjit::Label funcStart;
+asmjit::X86FuncNode* fnode;
   void Emit() {
     currentNode = 0;
     asmjit::FuncBuilderX builder;
@@ -1175,11 +1197,15 @@ public:
     for(size_t i = 0;i<this->sig.args.size();i++) {
       builder.addArg(asmjit::kVarTypeIntPtr);
     }
-    JITCompiler->nop();
-    this->funcStart = JITCompiler->addFunc(builder)->getEntryLabel();
-    
-    
-    
+    JITCompiler->bind(funcStart);
+    fnode = JITCompiler->addFunc(builder);
+    for(size_t i = 0;i<sig.args.size();i++) {
+      char mander[256];
+      memset(mander,0,256);
+      sprintf(mander,"arg%i",(int)i);
+      arg_regs[i] = JITCompiler->newIntPtr(mander);
+      JITCompiler->setArg(i,arg_regs[i]); //TODO: Something here with args causes assertion failure about register ID.
+    }
     //BEGIN set up stack
     
     stackOffsetTable = new size_t[localVarCount];
@@ -1204,10 +1230,7 @@ public:
     stackmem = JITCompiler->newStack(stackSize+(sizeof(double)*2),8);
     //END set up stack
     //BEGIN VARIABLES
-    for(size_t i = 0;i<sig.args.size();i++) {
-      arg_regs[i] = JITCompiler->newIntPtr();
-      JITCompiler->setArg(i,arg_regs[i]);
-    }
+    
     //END VARIABLES
     
     
@@ -1220,8 +1243,7 @@ public:
     }
     //END Code emit
     JITCompiler->endFunc();
-    JITCompiler->finalize();
-    nativefunc = JITAssembler->make();
+    
   }
   void Compile() {
     Parse();
@@ -1229,12 +1251,12 @@ public:
     Emit();
   }
   
-  
   void Parse() {
     
     //Generate parse tree
     unsigned char opcode;
     unsigned char* base = str.ptr;
+    
     BStream reader = str;
     while(reader.Read(opcode) != 255) {
       ualip = (uint32_t)((size_t)reader.ptr-(size_t)base)-1;
@@ -1695,7 +1717,14 @@ public:
 	      
 	    }
 	      break;
-	
+	    case 26:
+	    {
+	      uint32_t sz;
+	      reader.Read(sz);
+	      void* bufferBytes = reader.Increment(sz);
+	      Node_Stackop<ConstantBuffer>(AllocBuffer(bufferBytes,sz));
+	    }
+	      break;
 	default:
 	  printf("Unknown OPCODE %i\n",(int)opcode);
 	  goto velociraptor;
@@ -1777,10 +1806,22 @@ public:
       method->sig = mname;
       methods[mname] = method;
       methodCache[mname] = method;
+      
       if(method->isManaged) {
 	method->Compile();
+	
       }
+      
     }
+    
+    
+      JITCompiler->finalize();
+      size_t start = (size_t)JITAssembler->make();
+      for(auto i = methods.begin();i != methods.end();i++) {
+	UALMethod* meth = i->second;
+	meth->nativefunc = (void*)(start+JITAssembler->getLabelOffset(meth->funcStart));
+      }
+    
     }
   }
 };
@@ -1834,7 +1875,6 @@ public:
   }
   void LoadMain(int argc, char** argv) {
     //Find main
-    //TODO: Parse method signatures from strings
       UALType* mainClass = 0;
       UALMethod* mainMethod = 0;
       for(auto i = types.begin();i!= types.end();i++) {
@@ -1908,9 +1948,15 @@ int main(int argc, char** argv) {
   JITruntime = new asmjit::JitRuntime();
   JITAssembler = new asmjit::X86Assembler(JITruntime);
   JITCompiler = new asmjit::X86Compiler(JITAssembler);
-  for(size_t i = 0;i<17;i++) {
-    JITCompiler->newLabel();
-  }
+  
+  
+  
+  
+  asmjit::FileLogger logger(stdout);
+  JITAssembler->setLogger(&logger);
+  
+  
+  
   
   
  /* asmjit::FuncBuilderX fbuilder;
