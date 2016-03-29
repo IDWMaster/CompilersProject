@@ -1052,7 +1052,8 @@ public:
 		case UnconditionalSurrender:
 		{
 		  
-		  JITCompiler->jmp(bnode->label);
+		  JITCompiler->jmp(bnode->label); //TODO: This jmp instruction seems to get rid of assembly instructions
+		  
 		}
 		  break;
 		case Ble:
@@ -1177,7 +1178,10 @@ asmjit::X86FuncNode* fnode;
     JITCompiler->bind(funcStart);
     fnode = JITCompiler->addFunc(builder);
     for(size_t i = 0;i<sig.args.size();i++) {
-      arg_regs[i] = JITCompiler->newIntPtr();
+      char mander[256];
+      memset(mander,0,256);
+      sprintf(mander,"arg%i",(int)i);
+      arg_regs[i] = JITCompiler->newIntPtr(mander);
       JITCompiler->setArg(i,arg_regs[i]); //TODO: Something here with args causes assertion failure about register ID.
     }
     //BEGIN set up stack
@@ -1919,8 +1923,11 @@ int main(int argc, char** argv) {
   
   
   
+  
   asmjit::FileLogger logger(stdout);
   JITAssembler->setLogger(&logger);
+  
+  
   
   
   
