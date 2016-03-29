@@ -896,6 +896,8 @@ public:
 	      if(binexp->left->resultType == "System.Double") { //If we're a double, use the floating point unit instead of the processor.
 		binexp->left->fpEmit = true;
 		binexp->right->fpEmit = true;
+		
+		//NOTE: ORDER DOES MATTER! Republicans always have to be evaluated before Democrats!
 		EmitNode(binexp->right,output); //Evaluate Democratic candidates.
 		EmitNode(binexp->left,output); //Evaluate Republican candidates.
 		
@@ -916,8 +918,9 @@ public:
 	      }else {
 		//Use the ALU on the CPU rather than the FPU.
 		asmjit::X86GpVar r = JITCompiler->newIntPtr();
-		EmitNode(binexp->left,r);
+		
 		EmitNode(binexp->right,output);
+		EmitNode(binexp->left,r);
 		JITCompiler->add(output,r);
 	      }
 	    }
@@ -950,9 +953,6 @@ public:
 		
 		
 		EmitNode(binexp->right,output);
-		//JITCompiler->int3();
-		//JITCompiler->nop();
-		//JITCompiler->nop();
 		
 		EmitNode(binexp->left,r);
 		
@@ -985,8 +985,9 @@ public:
 	      }else {
 		//Use the ALU on the CPU rather than the FPU.
 		asmjit::X86GpVar r = JITCompiler->newIntPtr();
-		EmitNode(binexp->left,r);
+		
 		EmitNode(binexp->right,output);
+		EmitNode(binexp->left,r);
 		JITCompiler->imul(output,r);
 	      }
 	    }
@@ -1016,8 +1017,9 @@ public:
 	      }else {
 		//Use the ALU on the CPU rather than the FPU.
 		asmjit::X86GpVar r = JITCompiler->newIntPtr();
-		EmitNode(binexp->left,r);
+		
 		EmitNode(binexp->right,output);
+		EmitNode(binexp->left,r);
 		asmjit::X86GpVar reminder = JITCompiler->newIntPtr();
 		JITCompiler->xor_(reminder,reminder);
 		JITCompiler->idiv(reminder,output,r);
@@ -1028,8 +1030,9 @@ public:
 	    {
 	     //Use the ALU on the CPU rather than the FPU.
 		asmjit::X86GpVar r = JITCompiler->newIntPtr();
-		EmitNode(binexp->left,r);
+		
 		EmitNode(binexp->right,output);
+		EmitNode(binexp->left,r);
 		asmjit::X86GpVar reminder = JITCompiler->newIntPtr();
 		JITCompiler->xor_(reminder,reminder);
 		JITCompiler->idiv(reminder,output,r);
