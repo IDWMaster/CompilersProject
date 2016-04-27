@@ -395,16 +395,19 @@ enum NodeType {
 };
 
 
-
+//A parse node
 class Node {
 public:
-  
+  //The type of node
   NodeType type;
+  //The result type
   std::string resultType;
+  //The next node
   Node* next;
+  //The previous node
   Node* prev;
   bool fpEmit; //Whether or not the expression's output should be saved to the floating point stack.
-  asmjit::Label label;
+  asmjit::Label label; //The location of the instruction in the generated assembly code
   bool referenced; //Whether or not this label has been referenced already
   bool bound; //Whether or not this label has been bound
   
@@ -425,7 +428,7 @@ public:
   
   virtual ~Node(){};
 };
-
+//An expression representing a constant 32-bit integer.
 class ConstantInt:public Node {
 public:
   uint32_t value;
@@ -434,6 +437,7 @@ public:
     resultType = "System.Int32";
   }
 };
+//An expression representing a constant double.
 class ConstantDouble:public Node {
 public:
   double value;
@@ -442,7 +446,7 @@ public:
     resultType = "System.Double";
   }
 };
-
+//An expression representing a constant string.
 class ConstantString:public Node {
 public:
   const char* value;
@@ -451,6 +455,7 @@ public:
     resultType = "System.String";
   }
 };
+//An expression representing a buffer (pseudo-array intrinsic).
 class ConstantBuffer:public Node {
 public:
   size_t idx; //Index of the buffer into the constant pool
@@ -459,6 +464,7 @@ public:
     this->resultType = "System.Blob";
   }
 };
+//An expression which loads a value from a local variable
 class LdLoc:public Node {
 public:
   size_t idx; //The index of the local field to load from
@@ -467,6 +473,7 @@ public:
     this->resultType = type;
   }
 };
+//An expression which stores a value from the stack into a local variable.
 class StLoc:public Node {
 public:
   size_t idx;
@@ -476,7 +483,7 @@ public:
     this->exp = exp;
   }
 };
-
+//Loads an argument passed into a function
 class LdArg:public Node {
 public:
   size_t index;
@@ -485,7 +492,7 @@ public:
     this->resultType = type;
   }
 };
-
+//Returns from a function
 class Ret:public Node {
 public:
   Node* resultExpression;
@@ -503,6 +510,7 @@ enum BranchCondition {
   Bne //Branch on not equal
   
 };
+//A branch instruction
 class Branch:public Node {
 public:
   Node* left; //Democratic operand on comparison
@@ -589,11 +597,11 @@ static DeferredOperation* MakeDeferred(const T& functor) {
 
 class UALMethod {
 public:
-  BStream str;
-  bool isManaged;
-  void* assembly;
-  MethodSignature sig;
-  uint32_t localVarCount;
+  BStream str; //The UAL bytecode for the method
+  bool isManaged; //Whether or not this method is managed
+  void* assembly; //The UAL assembly in which this method resides
+  MethodSignature sig; //The method signature
+  uint32_t localVarCount; //The number of local variables in this function
   std::vector<std::string> locals;
   //asmjit::X86Compiler* JITCompiler;
   
@@ -804,7 +812,7 @@ public:
 	  
 	    case NLdLoc:
 	    {
-	      //TODO: Load local variable
+	      //Load local variable
 	      LdLoc* op = (LdLoc*)inst;
 	      asmjit::X86GpVar addr = JITCompiler->newIntPtr();
 	      JITCompiler->lea(addr,stackmem); //Load the effective base address of the stack
